@@ -1,0 +1,136 @@
+Raylo Apportionment Logic — Transactional Analysis Reference
+===========================================================
+
+Use this whenever you are reviewing the transactional state of an agreement
+(via Anchor / Aryza Lend) to validate how payments have been apportioned and
+whether late fees have been settled correctly.
+
+How Raylo classifies payments-in-arrears
+----------------------------------------
+Payments-in-arrears = (principal + interest in arrears) ÷ (principal +
+interest due in the regular instalment). Late fees, fees, VAT, and VAT on
+fees are NOT included in either side of that ratio. If you ever quote a
+"payments in arrears" figure, make sure you used principal+interest only.
+
+Normal Payment Priority Order
+-----------------------------
+When a payment is received, it is allocated against the OLDEST outstanding
+payment profile first. Within each profile, components settle in this order:
+
+  1. Principal
+  2. Interest
+  3. VAT on Fees
+  4. Fees
+  5. VAT
+
+Once a profile is fully satisfied, any remaining funds roll forward to the
+next oldest outstanding profile and follow the same order.
+
+Late Payment Fee — Correct Apportionment Logic
+----------------------------------------------
+Late fees are always paid LAST, but "last" is defined relative to what is
+actually outstanding at the exact moment the payment is processed — not
+relative to a fixed position in the agreement's history.
+
+Rules:
+
+1. A late fee is only paid if it is the LAST thing outstanding at the time
+   of payment. If any other component (principal, interest, VAT on fees,
+   fees, or VAT) remains outstanding across ANY instalment at the point of
+   payment, the late fee must wait. The payment must clear everything else
+   before a late fee can be settled.
+
+2. Overpayments flow to outstanding late fees. If a payment fully satisfies
+   all normal components across all due instalments and a surplus remains,
+   that surplus is applied to outstanding late fees. Late fees are the
+   final destination for overpayments, NOT a gap to fill mid-allocation.
+
+3. Reversals fully unwind the allocation state. If a transaction that
+   previously settled a late fee (or contributed to settling one) is
+   reversed, the reversal nulls out that settlement. The late fee returns
+   to outstanding and must be re-evaluated against whatever is outstanding
+   at the time of the next payment. There is NO memory of the previous
+   settlement — the slate is clean.
+
+This means late fee status is dynamic and time-relative. Always assess late
+fee position based on the current outstanding state at the moment of each
+payment event, not based on a static view of the agreement.
+
+Apportionment Decision Logic — Payment Received
+-----------------------------------------------
+For each payment event, in sequence:
+
+  1. Identify all outstanding payment profiles, oldest first.
+  2. For each profile, identify outstanding components in order:
+       Principal → Interest → VAT on Fees → Fees → VAT
+  3. Allocate the payment against these in order until funds are exhausted.
+  4. If funds remain after all normal components across all profiles are
+     cleared → apply surplus to any outstanding late fees, oldest first.
+  5. If a late fee was previously settled and a reversal has since
+     occurred → treat the late fee as outstanding again and re-run steps
+     1–4 from the point of the reversal.
+
+Reversal Handling — Key Diagnostic Rule
+---------------------------------------
+When you encounter a reversal (TypeId 50, or any other reversal type), you
+must:
+
+  - Identify what the original transaction settled.
+  - Unwind that settlement fully — restore all affected components to
+    outstanding.
+  - Re-evaluate late fee status from that point forward.
+  - Flag any downstream allocations that were based on the now-reversed
+    state as potentially incorrect.
+
+Common error pattern
+--------------------
+A late fee is settled by a card payment. That card payment is later
+reversed. Anchor does NOT always automatically reinstate the late fee as
+outstanding or re-apportion subsequent payments. This leaves the late fee
+appearing settled when it should not be, and subsequent payments may have
+been allocated incorrectly against normal components that were already
+effectively covered by the (now reversed) payment.
+
+Diagnosis Checklist — Late Fee Validation
+-----------------------------------------
+For each TypeId 49 (Late payment fee applied) on the agreement:
+
+  [ ] Is there an outstanding balance on any normal component (principal,
+      interest, VAT on fees, fees, VAT) across any instalment at the point
+      the late fee was settled?
+        → If yes, the late fee was settled too early. Flag as
+          "apportionment error: late fee prioritised incorrectly".
+
+  [ ] Has any transaction that contributed to settling this late fee been
+      subsequently reversed?
+        → If yes, the late fee settlement is nulled. Flag as outstanding
+          and re-assess all downstream allocations from the reversal date.
+
+  [ ] Does the current API state reflect this correctly?
+        → If no, flag as "apportionment error: reversal not reflected in
+          late fee status".
+
+Core principle
+--------------
+Late fee position is NOT fixed in the agreement timeline. It is always
+evaluated fresh against what is outstanding at the moment of each payment,
+and reversals reset that evaluation entirely.
+
+Relevant TypeIds (for cross-reference)
+--------------------------------------
+  - 0  Cash receipt (payment)
+  - 12 Direct debit (payment)
+  - 14 Upfront payment
+  - 23 Card payment (S) — common settlement origin for late fees
+  - 24 Card payment (S) reversal — the common offender for reversed late
+       fee settlements; check every TypeId 24 against any TypeId 49 it may
+       have settled.
+  - 29 FPC payment
+  - 45 Raylo payment
+  - 48 Raylo payment reversal
+  - 49 Late payment fee
+  - 50 Late payment fee reversal
+  - 53 Opos payment
+  - 99 Instalment Due (the profile-level expected amount)
+  - 150–156 Returned DDs (DD reversals — also strip funds from earlier
+       allocations; treat as reversals for the purposes of these rules)

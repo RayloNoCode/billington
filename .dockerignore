@@ -1,0 +1,41 @@
+# Build artefacts and local dev junk we don't need in the container.
+node_modules
+npm-debug.log
+.npm
+.cache
+
+# Local secrets and runtime state — Cloud Run gets these via env vars and
+# (optionally) a GCS bucket mount. Do NOT bake them into the image.
+.env
+.env.*
+raylo-service-account.json
+gcp-sa.json
+reminders.json
+aryza-tickets.json
+stannp-balance-history.json
+
+# Editor / OS
+.DS_Store
+.vscode
+.idea
+*.swp
+*.swo
+
+# Git metadata — Cloud Build doesn't need it
+.git
+.gitignore
+.gitattributes
+
+# PM2 + local logs
+.pm2
+*.log
+logs/
+
+# CI / test
+coverage
+.nyc_output
+test-results
+
+# Docs that don't need to ship
+*.md
+docs/

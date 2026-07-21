@@ -1,0 +1,553 @@
+Payment Profile Issues — Standard Operating Procedure
+======================================================
+
+Billington owns the Payment Profiles Issues page in Notion end to end.
+Each group of impacted agreements gets one row in the Issue Tracker
+table, one Population & Details child page, and Historical Values
+child pages within those detail pages whenever an amendment occurs.
+
+Notion home:
+  Payment Profiles Issues page (parent of all detail pages):
+    https://www.notion.so/35e5bb4b4a65819592bec68918c0cc0e
+  Parent context: Billing Operations → Anchor Tickets Tracking →
+    Payment Profiles Issues.
+
+Operational decisions (Hargo, 12/05/2026)
+-----------------------------------------
+- **Schedule**: AD-HOC ONLY (Hargo, 13/05/2026). The daily 12:00
+  London cron is currently DISABLED while Hargo reviews the
+  implementation end-to-end. Trigger only when Hargo asks via
+  DM or mention ("run payment profile check"). Re-enable once
+  Hargo signs it off after A/L.
+- **Output**: DM to Hargo only until further notice. No shared
+  channel post until Hargo explicitly tells Billington it's ready.
+- **Anchor write path**: NONE. Billington never writes corrections.
+  Role is read + verify: getAgreement from Anchor, check whether
+  the profile has been amended, and confirm the amendment matches
+  what the Issue Tracker expects. Autonomous corrections are
+  forbidden, no exceptions.
+- **Reference key**: Billington sets its own *Raylo reference* on
+  every Issue Tracker row at the point of detection. Detection
+  does NOT wait for an Aryza ticket — the row is created
+  immediately.
+- **Daily checks are unconditional**: Billington runs the query
+  and verifies every open row EVERY working day, regardless of
+  Aryza Reference state, ops-side resolution status, or how long
+  the row has been open. The point is accountability: ops, Aryza,
+  and Hargo all need to see Billington watching daily until the
+  variance is gone from the query AND verified gone in Anchor.
+  The Aryza Reference field is *informational and chase-worthy*,
+  NOT a status gate.
+- **Priority assignment**:
+    P1 (priority 1) — affected due_date(s) already in the past
+                      (≤ today London). Money was already collected
+                      or missed at the wrong amount. URGENT.
+    P2 (priority 2) — affected due_date(s) all in the future
+                      (> today London). Preventable. Standard.
+  A row's priority is P1 if any of its entries is past-due,
+  otherwise P2. Population & Details rows carry per-entry priority.
+- **Daily DM order**: P1 first, P2 second. Within each priority,
+  sort by oldest first-detection date (longest-outstanding rows
+  surface first so they don't get lost).
+- **Volume threshold**: > 200 distinct agreements in a single run
+  → flag to Hargo and take no further action (no Notion writes,
+  no rows created). Likely a systemic issue requiring a bulk
+  remediation path.
+- **Notion structure**: the Issue Tracker is a STATIC HTML table
+  inside the Payment Profiles Issues page (NOT a database).
+  Status values are simply "Corrected" or "Not Corrected" — no
+  Open/In Progress/Complete states. Each daily run rewrites the
+  table wholesale with the latest values. Rows stay on the table
+  forever; their Status field flips between "Not Corrected" and
+  "Corrected" based on the current state.
+- **Wave model**: each Issue Tracker row represents a DETECTION
+  WAVE (a cohort of fingerprints flagged together). The wave's
+  Population & Details child page holds ONE big table with one
+  row per (agreement_id, due_date) entry, each carrying its own
+  per-entry Corrected / Not Corrected Status. The Issue Tracker
+  row's Status is "Corrected" only once every entry on its PD
+  page is Corrected.
+- **Daily refresh of an open row**:
+    - For each entry on the page:
+        - If currently "Corrected" → FROZEN. Skip in checks.
+          Never re-evaluate, never flip back. The entry stays
+          on the page forever as historical record.
+        - If currently "Not Corrected":
+            - Fingerprint still in today's query → stays Not
+              Corrected, live values refreshed from query.
+            - Fingerprint no longer in today's query → flip to
+              Corrected.
+    - Bump Date Last Checked.
+    - If every entry on the page is now Corrected, flip the
+      Issue Tracker row's Status to "Corrected".
+- **New-wave detection (fingerprint level)**:
+    - "Covered" = Not Corrected entries on any OPEN row. Frozen
+      Corrected entries are NOT covered.
+    - For each entry in today's query whose fingerprint is NOT
+      covered, it goes to a NEW wave row. This catches:
+        a) Genuinely new fingerprints (different due_date,
+           previously unseen).
+        b) Regressions: a previously-Corrected fingerprint that
+           reappears in today's query. Its old Corrected line
+           stays frozen on the old page; a fresh Not Corrected
+           line lands on the new wave page so the regression
+           gets explicit visibility.
+    - All new entries from today's run land on ONE new PD page
+      with ONE new Issue Tracker row.
+
+Daily flow
+----------
+1. Run the detection query (Step 1) at 12:00 London.
+2. Classify each row by variance type (Step 2).
+3. Cross-reference with the Issue Tracker (Step 3).
+4. For new groups, create the row + Population & Details page
+   with a Billington-generated Raylo reference (Step 4).
+5. Cross-check Aryza inbox for a matching confirmation; if none,
+   chase Hargo for the ticket reference (Step 5). Detection does
+   NOT depend on the ticket — only "actioned" closure does.
+6. After ops apply corrections in Anchor (outside Billington),
+   Billington verifies via getAgreement and logs Historical
+   Values (Step 6). No writes from Billington's side.
+7. Mark profile entries and groups complete only after API
+   verification passes against the Expected Amount (Step 7).
+8. Re-run daily; agreements that reappear after being marked
+   Corrected get a NEW row (Step 8) — preserve history cleanly.
+
+
+1. Daily detection query
+------------------------
+Run the following BigQuery query against `raylo-production`. It
+returns every payment profile entry whose net_amount does not match
+the expected instalment amount, excluding the first instalment,
+residuals, damage fees, and any agreement already with a settlement
+date recorded. Scoped to next_payment_date within the next 360 days.
+
+```sql
+WITH
+hire_agreements AS (
+  SELECT
+    agreement_id,
+    CAST(hire_agreements.recurring_amount_including_tax AS DECIMAL)
+      AS hire_agreement_recurring_amount_including_tax
+  FROM `raylo-production.dbt_production.stg_raylo_production__hire_agreements` AS hire_agreements
+  LEFT JOIN `raylo-production.dbt_production.intermediate_core_aggregated_identities` AS identities
+    ON identities.checkout_item_id = hire_agreements.checkout_item_id
+  WHERE agreement_id IS NOT NULL
+  QUALIFY RANK() OVER (PARTITION BY hire_agreements.checkout_item_id ORDER BY created_at DESC) = 1
+),
+agreements AS (
+  SELECT DISTINCT
+    core_agreements.agreement_id,
+    core_subscriptions.subscription_id,
+    DATE(agreement_date) AS agreement_date,
+    ROUND(recurring_total_amount_after_tax, 2) AS regular_installment_amount,
+    ROUND((recurring_total_amount_after_tax * 0.35), 2) AS discounted_installment_amount,
+    ROUND(hire_agreement_recurring_amount_including_tax, 2) AS regular_installment_amount_hire,
+    term_length,
+    CASE WHEN term_length = 1 THEN 9 ELSE term_length END AS anchor_term_length,
+    DATE(subscription_upgraded_at) AS subscription_upgraded_at,
+    instalment_net,
+    total_fees / num_payments AS fee_net,
+    core_agreements.instalment_vat,
+    DATE(core_agreements.next_payment_date) AS next_payment_date,
+    instalment_ins,
+    advance_instalment_vat,
+    expected_instalment,
+    advance_instalment_net
+  FROM `raylo-production.dbt_production.core_agreements` AS core_agreements
+  LEFT JOIN `raylo-production.dbt_production.core_subscriptions` AS core_subscriptions
+    ON core_subscriptions.agreement_id = core_agreements.agreement_id
+  LEFT JOIN `raylo-production.dbt_production.orders_summary` AS orders_summary
+    ON orders_summary.agreement_id = core_agreements.agreement_id
+  LEFT JOIN hire_agreements ON hire_agreements.agreement_id = core_agreements.agreement_id
+),
+payment_profiles AS (
+  SELECT
+    payment_profiles.agreement_id,
+    payment_profile_id,
+    DATE(due_date) AS due_date,
+    net_amount,
+    LOWER(type) AS type,
+    CASE WHEN fee_or_insid IS NULL THEN 0 ELSE fee_or_insid END AS fee_or_insid,
+    CASE WHEN subtype_description = '' THEN NULL ELSE subtype_description END AS subtype_description,
+    CASE WHEN LOWER(subtype_description) = 'damage fee' THEN TRUE ELSE FALSE END AS damage_fee_profile_entry,
+    CASE WHEN is_residual IS NULL THEN FALSE ELSE is_residual END AS is_residual,
+    CASE
+      WHEN net_amount = ROUND(instalment_net * 0.35, 2) THEN TRUE
+      WHEN net_amount = instalment_net                  THEN FALSE
+      ELSE NULL
+    END AS discounted_secondary
+  FROM `raylo-production.dbt_production.stg_landing_sentinel_s3db01__payment_profiles` AS payment_profiles
+  LEFT JOIN agreements ON agreements.agreement_id = payment_profiles.agreement_id
+  WHERE type <> '' AND type IS NOT NULL
+    AND payment_profile_id IS NOT NULL
+    AND payment_profiles.agreement_id IS NOT NULL
+    AND (net_amount > 0 OR fee_or_insid = 5)
+    AND NOT (reloan_id IS NULL AND (fee_or_insid = 6) AND type = 'Fee')
+),
+installment_profiles AS (
+  SELECT DISTINCT
+    payment_profiles.*,
+    RANK() OVER (
+      PARTITION BY agreement_id, net_amount,
+        CASE
+          WHEN LOWER(type) IN ('pay','sec')                       THEN 'pay_sec'
+          WHEN LOWER(type) IN ('fee','sfn') AND fee_or_insid = 1 THEN 'fee_sfn_1'
+          WHEN LOWER(type) IN ('fee','sfn') AND fee_or_insid = 2 THEN 'fee_sfn_2'
+          WHEN LOWER(type) IN ('fee','sfn') AND fee_or_insid = 3 THEN 'fee_sfn_3'
+          WHEN LOWER(type) IN ('fee','sfn') AND fee_or_insid = 4 THEN 'fee_sfn_4'
+          WHEN LOWER(type) IN ('fee','sfn') AND fee_or_insid = 6 THEN 'fee_sfn_6'
+          WHEN LOWER(type) IN ('vfe','sfv') AND fee_or_insid = 1 THEN 'vfe_sfv_1'
+          WHEN LOWER(type) IN ('vfe','sfv') AND fee_or_insid = 2 THEN 'vfe_sfv_2'
+          WHEN LOWER(type) IN ('vfe','sfv') AND fee_or_insid = 3 THEN 'vfe_sfv_3'
+          WHEN LOWER(type) IN ('vfe','sfv') AND fee_or_insid = 4 THEN 'vfe_sfv_4'
+          WHEN LOWER(type) IN ('vfe','sfv') AND fee_or_insid = 6 THEN 'vfe_sfv_6'
+          WHEN LOWER(type) IN ('vat','vsc')                       THEN 'vat_vsc'
+        END
+      ORDER BY due_date, payment_profile_id ASC
+    ) AS instalment_profile_rank,
+    RANK() OVER (
+      PARTITION BY agreement_id, net_amount,
+        CASE
+          WHEN LOWER(type) IN ('pay','sec')                       THEN 'pay_sec'
+          WHEN LOWER(type) IN ('fee','sfn') AND fee_or_insid = 1 THEN 'fee_sfn_1'
+          WHEN LOWER(type) IN ('fee','sfn') AND fee_or_insid = 2 THEN 'fee_sfn_2'
+          WHEN LOWER(type) IN ('fee','sfn') AND fee_or_insid = 3 THEN 'fee_sfn_3'
+          WHEN LOWER(type) IN ('fee','sfn') AND fee_or_insid = 4 THEN 'fee_sfn_4'
+          WHEN LOWER(type) IN ('fee','sfn') AND fee_or_insid = 6 THEN 'fee_sfn_6'
+          WHEN LOWER(type) IN ('vfe','sfv') AND fee_or_insid = 1 THEN 'vfe_sfv_1'
+          WHEN LOWER(type) IN ('vfe','sfv') AND fee_or_insid = 2 THEN 'vfe_sfv_2'
+          WHEN LOWER(type) IN ('vfe','sfv') AND fee_or_insid = 3 THEN 'vfe_sfv_3'
+          WHEN LOWER(type) IN ('vfe','sfv') AND fee_or_insid = 4 THEN 'vfe_sfv_4'
+          WHEN LOWER(type) IN ('vfe','sfv') AND fee_or_insid = 6 THEN 'vfe_sfv_6'
+          WHEN LOWER(type) IN ('vat','vsc')                       THEN 'vat_vsc'
+        END,
+        CASE
+          WHEN LOWER(type) IN ('pay','fee','vfe','vat') THEN 'primary'
+          WHEN LOWER(type) IN ('sec','sfn','sfv','vsc') THEN 'secondary'
+        END
+      ORDER BY due_date, payment_profile_id ASC
+    ) AS term_rank,
+    CASE
+      WHEN LOWER(type) IN ('pay','fee','vfe','vat') THEN 'primary'
+      WHEN LOWER(type) IN ('sec','sfn','sfv','vsc') THEN 'secondary'
+    END AS term_type
+  FROM payment_profiles
+  WHERE is_residual IS FALSE
+    AND damage_fee_profile_entry IS FALSE
+    AND fee_or_insid <> 5
+),
+instalment_profile_sums AS (
+  SELECT
+    agreement_id, due_date, instalment_profile_rank, term_rank,
+    SUM(net_amount) net_amount, term_type,
+    MAX(discounted_secondary) AS discounted_secondary
+  FROM installment_profiles
+  GROUP BY agreement_id, due_date, instalment_profile_rank, term_rank, term_type
+),
+instalment_profile_sums_reranked AS (
+  SELECT
+    agreement_id,
+    due_date,
+    net_amount,
+    term_type,
+    discounted_secondary,
+    RANK() OVER (PARTITION BY agreement_id, term_type, discounted_secondary, net_amount ORDER BY due_date ASC) AS term_rank,
+    RANK() OVER (PARTITION BY agreement_id ORDER BY due_date ASC) AS instalment_rank,
+    COUNT(*) OVER (PARTITION BY agreement_id, due_date) AS instalment_count_per_day
+  FROM instalment_profile_sums
+  GROUP BY ALL
+),
+payment_profile_sum_by_due_date AS (
+  SELECT
+    agreement_id,
+    SUM(net_amount) AS net_amount,
+    due_date,
+    term_type,
+    RANK() OVER (PARTITION BY agreement_id, term_type ORDER BY due_date ASC) AS term_rank,
+    RANK() OVER (PARTITION BY agreement_id ORDER BY due_date ASC) AS instalment_rank
+  FROM instalment_profile_sums
+  GROUP BY agreement_id, due_date, term_type
+),
+issue AS (
+  SELECT
+    payment_profile_sum_by_due_date.*,
+    regular_installment_amount,
+    discounted_installment_amount,
+    regular_installment_amount_hire,
+    anchor_term_length,
+    CASE
+      WHEN (net_amount - regular_installment_amount BETWEEN -0.01 AND 0.01
+         OR net_amount - regular_installment_amount_hire BETWEEN -0.01 AND 0.01)
+         AND instalment_rank > 1 AND term_type <> 'secondary' THEN FALSE
+      WHEN (net_amount - regular_installment_amount BETWEEN -0.01 AND 0.01
+         OR net_amount - regular_installment_amount_hire BETWEEN -0.01 AND 0.01)
+         AND term_rank <= 24 AND instalment_rank > 1 THEN FALSE
+      WHEN term_rank > 24 AND term_type = 'secondary'
+         AND net_amount - discounted_installment_amount BETWEEN -0.02 AND 0.02 THEN FALSE
+      WHEN instalment_rank = 1 THEN FALSE
+      ELSE TRUE
+    END AS issue_to_review,
+    next_payment_date
+  FROM payment_profile_sum_by_due_date
+  LEFT JOIN agreements ON agreements.agreement_id = payment_profile_sum_by_due_date.agreement_id
+  WHERE agreements.regular_installment_amount IS NOT NULL
+)
+SELECT
+  issue.*,
+  CASE WHEN term_type = 'secondary' AND term_rank > 24 THEN TRUE ELSE FALSE END AS discounted_secondary
+FROM issue
+LEFT JOIN `raylo-production.landing_billington.agreement_settlement_dates` AS settlement
+  ON settlement.agreement_id = issue.agreement_id
+WHERE issue_to_review IS TRUE
+  AND settlement_date IS NULL
+  AND next_payment_date < CURRENT_DATE() + 360
+```
+
+Key fields per row:
+  agreement_id                       — affected agreement
+  due_date                           — specific profile entry date that is wrong
+  net_amount                         — what the profile currently shows
+  regular_installment_amount         — expected (primary)
+  regular_installment_amount_hire    — hire agreement equivalent
+  discounted_installment_amount      — expected if discounted secondary
+  term_type                          — primary or secondary
+  term_rank                          — position in term sequence
+  instalment_rank                    — overall instalment position
+  discounted_secondary               — whether this is a discounted secondary
+  next_payment_date                  — when the next payment is due
+
+
+2. Classify the discrepancy
+---------------------------
+For each row:
+  variance = net_amount − regular_installment_amount
+
+Impact type:
+  Overcharged  — net_amount > regular_installment_amount
+  Undercharged — net_amount < regular_installment_amount
+  Also compare against regular_installment_amount_hire and
+  discounted_installment_amount where applicable.
+
+Group results by agreement_id. One agreement can have multiple
+affected profile entries.
+
+
+3. Compare against the Issue Tracker
+------------------------------------
+Fetch the Issue Tracker table from the Payment Profiles Issues page.
+For each agreement returned by the query:
+
+  - Not on any open/in-progress row, OR appears in a row previously
+    marked Complete → NEW group. Go to Step 4.
+  - Exists on an open/in-progress row → update Date Last Checked
+    on that row to today. Go to Step 6.
+
+
+4. Create a new row + Population & Details page
+-----------------------------------------------
+4a. Create the Population & Details child page UNDER the Payment
+Profiles Issues page BEFORE writing to the Issue Tracker.
+  Title: "Payment Profile Issue — [YYYY-MM-DD] — [impact type summary]"
+
+The page contains one row per affected profile entry:
+
+  | Agreement ID | Due Date | Priority | Term Type | Term Rank |
+  | Instalment Rank | Current Net Amount | Expected Amount |
+  | Variance | Impact Type | Status |
+
+  Priority            = P1 if Due Date ≤ today London (past-due)
+                        P2 otherwise (future-due)
+  Current Net Amount  = net_amount from query
+  Expected Amount     = regular_installment_amount
+                        (or hire/discounted equivalent)
+  Variance            = current − expected
+  Impact Type         = Overcharged / Undercharged
+  Status              = Corrected / Not Corrected
+
+The Population & Details page ALWAYS reflects the latest known
+values. Update it daily — promote P2 entries to P1 once their
+due_date passes; refresh Current Net Amount from Anchor; flip
+Status to Corrected when the entry is verified fixed.
+
+4b. Add a row to the Issue Tracker table:
+
+  Date of First Check          → today
+  Date Last Checked            → today
+  Raylo Reference              → Billington-generated unique key
+                                 (format: RPP-YYYYMMDD-NNN)
+  Priority                     → P1 if any entry in the group is
+                                 past-due, else P2
+  Unique Agreements Impacted   → distinct agreement count
+  Profile Entries Impacted     → total affected profile-entry rows
+  Impact Type                  → Overcharged / Undercharged / Mixed
+  Aryza Reference              → BLANK at detection; populated
+                                 once ops raise the matching ticket
+                                 (see Step 5). Missing reference
+                                 does NOT block daily checks.
+  Population & Details         → link to the page from 4a
+  Status                       → Not Corrected
+
+The Raylo Reference is the *unique key* on the row from detection
+onward. Anchor changes happen outside Billington — when ops fix a
+profile, the matching Aryza confirmation lands in
+billingoperations@. Billington uses the Raylo Reference internally
+to keep the row stable across days.
+
+
+5. Aryza Reference + ops confirmation
+-------------------------------------
+Detection does NOT wait for an Aryza ticket. The row is created
+the moment the population is identified, with the Raylo Reference
+as the unique key. Daily checks run unconditionally — Aryza
+Reference status NEVER gates whether Billington verifies and
+updates the row.
+
+After detection, Billington watches the billingoperations@ inbox
+for a matching Aryza confirmation. Match criteria:
+  - Email subject/body references the affected agreement IDs, OR
+  - Email references the Raylo Reference Billington recorded.
+
+  - No match within 48h (2 working days) →
+      Chase Hargo in the daily DM: "Raylo Reference
+      RPP-YYYYMMDD-NNN (N agreements, [impact summary]) — no
+      matching Aryza confirmation in the inbox. What's the
+      ticket reference?" The row continues its daily verification
+      regardless. The chase repeats daily until the reference is
+      recorded.
+
+  - Match found, ticket reference parsed (e.g. ARY-1234) →
+      Verify the Aryza ticket scope (agreement IDs and impact
+      direction) matches Billington's population. If it does,
+      record the reference. If scope differs (extra/missing
+      agreements), flag the diff to Hargo before recording.
+
+  - Textual matching alone is NOT sufficient to close out the
+    Aryza Reference field. Hargo must confirm any borderline
+    match.
+
+A missing Aryza Reference is informational — it surfaces in the
+daily DM until cleared. It does NOT block Status transitions
+(Open → Corrected → Complete). Status moves based on whether the
+variance is gone from the query AND verified gone in Anchor; the
+ticket field tracks accountability separately.
+
+
+6. Verify corrections (Billington is read-only)
+-----------------------------------------------
+Ops apply corrections to PaymentProfile entries directly in Anchor
+or via their internal toolchain. Billington does NOT write to
+Anchor in this workflow.
+
+For each row in the Population & Details page with Status = Open,
+each daily check Billington:
+
+6a. Calls getAgreement on the affected agreement_id to read the
+    current PaymentProfile from Anchor.
+
+6b. Compares the Anchor net_amount for the affected due_date(s)
+    against the Expected Amount recorded on the Population &
+    Details page.
+
+6c. If a change has occurred (Anchor net_amount no longer matches
+    the original Current Net Amount), BEFORE updating the
+    Population & Details page, create a Historical Values child
+    page INSIDE it.
+    Title: "Amendment Log — [Agreement ID] — [YYYY-MM-DD HH:MM]"
+
+    Body table:
+
+      | Field         | Before    | After    |
+      | net_amount    | [old]     | [new]    |
+      | [other field] | [old]     | [new]    |
+
+    Historical Values pages are IMMUTABLE. If the same agreement
+    requires another correction later, create a new Historical
+    Values page with a new timestamp. Do not edit existing ones.
+
+6d. Update the Population & Details page — set Current Net Amount
+    to the new (Anchor-reported) value.
+    - If new value matches Expected Amount (±£0.01) → set the
+      entry's Status = Corrected.
+    - If new value still differs from Expected → set the entry's
+      Status = Not Corrected and record the residual variance in
+      the notes.
+    - The Aryza Reference field is INDEPENDENT of Status. The
+      row's Status is "Corrected" as soon as every entry verifies
+      green in Anchor, regardless of whether the Aryza Reference
+      is recorded; the reference is chased separately in the
+      daily DM until cleared.
+
+6e. Also refresh Priority each day:
+    - Any P2 entry whose due_date has now passed becomes P1.
+    - Row-level Priority is the highest priority among its
+      entries (P1 if ANY entry is past-due, else P2).
+
+
+7. Marking completion
+---------------------
+- Profile entry level: Mark Corrected ONLY after API verification
+  passes (Anchor net_amount matches Expected ±£0.01).
+- Row level: Status is "Corrected" once every entry in the
+  Population & Details page is Corrected. Otherwise Status is
+  "Not Corrected".
+- Aryza Reference does NOT block the Status flip. If the row's
+  Status is Corrected but the Aryza Reference is still blank,
+  Billington continues to chase Hargo for the reference daily
+  until cleared (separate from the Status field).
+- Rows stay on the Issue Tracker permanently — they're never
+  archived or removed. The Status field is the source of truth
+  for current state. If the variance reappears on a Corrected
+  row in tomorrow's query, see Step 8.
+
+
+8. Daily repeat
+---------------
+Each day Billington:
+
+  - Re-runs the Step 1 query.
+  - Reads the existing Issue Tracker table from the Notion page.
+  - For every existing row (regardless of Status), calls
+    getAgreement on each agreement_id in its population, compares
+    Anchor net_amount to Expected Amount, and refreshes the
+    Population & Details child page. Logs Historical Values for
+    any changed entry.
+  - Updates the row's Status: "Corrected" if every entry verifies
+    green, otherwise "Not Corrected".
+  - Updates Date Last Checked on every row.
+  - For any new agreement in today's query that isn't on the
+    table → creates a fresh row. If the agreement is on a row
+    whose Status is currently "Corrected" but it reappears in
+    today's query → starts a NEW row (preserves history; signals
+    regression).
+  - Refreshes Priority across all rows (P2 → P1 as due_dates
+    pass).
+  - Rewrites the Issue Tracker table on the Notion page in one
+    pass with the latest values for every row.
+  - DMs Hargo a summary, ordered P1 first then P2, oldest
+    first-detection date first within each priority. The DM
+    includes:
+      * New groups detected today (with Raylo References)
+      * Existing groups: current Status, what changed since
+        yesterday, days outstanding
+      * Aryza Reference chase list: any row >48h old with
+        Status = Not Corrected and no recorded reference
+      * Volume warning if > 200 agreements today (and no Notion
+        writes were made)
+      * Any verification mismatches: rows where Anchor net_amount
+        changed but the new value still doesn't match Expected.
+
+
+Safety rails
+------------
+- Billington NEVER writes corrections to Anchor in this workflow.
+  No exceptions. getAgreement only.
+- If the query returns more than 200 distinct agreements in a
+  single run, DM Hargo with the volume + variance summary and
+  take no further action — no Notion writes, no rows created.
+  Likely a systemic issue requiring bulk remediation.
+- Aryza Reference cannot be closed out by textual matching alone.
+  Hargo must confirm any borderline match.
+- Historical Values pages are append-only. Never overwrite.
+- Output channel is DM-to-Hargo only until Hargo explicitly opens
+  it up to a shared channel.

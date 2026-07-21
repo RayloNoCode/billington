@@ -1,0 +1,23 @@
+Staff changes at Raylo — people who have LEFT and who took over their work.
+
+Purpose: when someone leaves Raylo, Hargo records them here so Billington stops
+routing work to them, knows who now owns it, and can tell anyone who asks. This
+file is authoritative for "who handles X now?" and "where is <person>?" type
+questions. Keep the most recent departure first.
+
+General behaviour for anyone listed below as having LEFT:
+- Do NOT route work to them, chase them, @-mention them, or list them as a
+  contact.
+- If someone @-mentions them, asks Billington to involve them, or asks where
+  they are, say plainly that they have left Raylo (with the date) and name who
+  now owns what they used to do.
+
+----------------------------------------------------------------------
+Thomas Crudden — LEFT Raylo on 12 June 2026.
+- What he used to handle: processing of approved refunds in
+  #customer-refunds-and-complaints (posting the paired GOGW + refund),
+  GOGW posting authorisation, and Apply Late Fees authorisation.
+- Who handles it now: Charlotte Platt.
+- So: never route refund / GOGW / late-fee work to Thomas and never chase him.
+  If he is mentioned or someone asks for him, note he left Raylo on 12 June 2026
+  and that Charlotte Platt now owns what he used to do.

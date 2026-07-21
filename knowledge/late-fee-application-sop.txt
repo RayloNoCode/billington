@@ -1,0 +1,228 @@
+Late Payment Fee (LPF) Application — Standard Operating Procedure
+=================================================================
+
+The decision to apply late payment fees on a given working day is
+data-dependent. Raylo waits until the underlying BACS / Anchor /
+GoCardless data is in before triggering the application. Acting too
+early on incomplete data leads to incorrect LPFs being posted, which
+then have to be reversed manually (the 24/04/2026 incident — 466
+incorrect LPFs from duplicate funder rows — is the recurring example).
+
+If the data is not ready by the operational cut-off, escalate to the
+data strategy team rather than proceeding.
+
+This document covers:
+  1. Daily flow and timing
+  2. Pre-application data readiness checks
+  3. Decision tree
+  4. The Make.com scenarios to invoke
+  5. Escalation criteria and contacts
+  6. Post-application validation
+  7. Known failure modes
+
+
+1. Daily flow and timing
+------------------------
+- *08:00–08:30* — GoCardless / Aryza process the previous working day's
+  collections. Bounces (TypeId 150–156 in Anchor) start landing.
+- *08:00 Tue–Fri, 10:30 Mon* — Daily ARUDD bounce report posted by
+  Billington to #data-billing-updates.
+- *08:40 Mon–Fri* — Billington runs the Late Fee Readiness Check
+  (runLateFeeReadinessCheck) and rechecks every 30 minutes until 15:00
+  or until criteria are met.
+- *Target window for LPF application* — between 09:30 and ~13:00 on
+  a normal day, once the readiness checks pass. The Make scenario
+  takes roughly 2h 48m – 3h 34m to apply fees at current volume bands
+  (under 20k DDs) and longer at higher volumes — see the BACS volume
+  indicator on each forecast for the day's expected window.
+
+
+2. Pre-application data readiness checks
+----------------------------------------
+LPFs can only be applied once all of the following are true. The
+08:40 cron checks every one of these and re-runs until they're all
+green or until 15:00.
+
+a. **ARUDD ≥ 99% reconciled**
+   - `total_failed_go_cardless` from GoCardless = sum of
+     `instalment_direct_debits_bounced_count + recollection_direct_debits_bounced_count + repair_direct_debits_bounced_count`
+     in Anchor (within 1%).
+   - Surface query: `bacs_monitoring` WHERE `due_date = prev_working_day(today)`.
+
+b. **Collection bounce rate within normal band**
+   - Today's collection bounce rate vs the 6-week rolling average.
+   - Normal range: 8–13% (`instalment_direct_debits_bounced_count / total_instalments_due`).
+   - If today's rate < 50% of the rolling average → almost certainly
+     means the ARUDD file isn't fully processed yet. Billington
+     surfaces this as a soft fail even when ARUDD shows 99% reconciled,
+     because GC may also be under-reporting at that point.
+   - If today's rate > 150% of the rolling average → also flag, possible
+     systemic issue with collections (e.g. mandate cancellations,
+     payment provider outage).
+
+c. **Source tables updated today**
+   - `dbt_production.core_subscriptions` — updated after 00:00 London
+   - `dbt_production.core_payment_profiles` — updated after 00:00 London
+   - `dbt_production.collections_controls_late_payment_fees_to_apply`
+     (pending_late_fees source) — updated after 00:00 London
+   - Each must have `last_modified_time` > midnight London today, else
+     the LPF queue is stale and we'd apply yesterday's fees against
+     today's state.
+
+d. **paymentservices_anchor table is fresh**
+   - Confirmed issue (28/04/2026 to ~04/05/2026): this table can stall
+     and stop emitting updates, which cascades into BACS forecasts and
+     missing-instalment-due checks. Always sanity-check before applying
+     LPFs.
+   - Ask Billington: `when was bacs_monitoring last updated?` or check
+     `INFORMATION_SCHEMA.PARTITIONS` for `paymentservices_*` tables.
+
+e. **No outstanding LPF reversals from previous day**
+   - If the previous day applied LPFs incorrectly and a reversal is
+     in flight, hold today's application until the reversals are
+     posted. Otherwise the customer sees both the wrong LPF AND a
+     fresh one stacked on top.
+
+
+3. Decision tree
+----------------
+- All four readiness criteria green → **PROCEED**. Apply LPFs via the
+  Make scenario.
+- ARUDD < 99% reconciled OR bounce rate < 50% of average OR a source
+  table is stale → **WAIT**. Recheck in 30 min. The 08:40 cron handles
+  this automatically.
+- Still failing by ~12:30 → **ESCALATE** (see section 5).
+- Still failing by 14:00 → **DECIDE BY 14:30** whether to apply
+  partial fees, defer to next working day, or hold for a longer window.
+  Hargo's documented approach (28/04/2026 incident): when a critical
+  data issue was blocking late fees AND a recollection file was due
+  the same day, Hargo prioritised the recollection file at 14:00 and
+  held the LPF application — 1,061 fees were not applied that day,
+  with 597 agreements given a one-cycle grace period and fees applied
+  if/when bounces occurred.
+- Applying after 14:30 risks the customer's NODS email going out late
+  or not at all that day — avoid unless explicitly approved.
+
+
+4. Make.com scenarios
+---------------------
+Two scenarios run the operational pieces. Both are in the Raylo
+Make.com workspace (team 74172).
+
+a. **Apply Fees** (Billington can trigger this on request)
+   - Scenario ID: `4509808`
+   - URL: https://eu1.make.com/74172/scenarios/4509808/edit
+   - Purpose: posts a TypeId 49 (Late payment fee) to Anchor for each
+     row in the pending_late_fees queue.
+   - Triggering: any authorised operator can ask Billington ("apply
+     late fees", "run late fees", "trigger scenario 4509808") and
+     Billington will:
+       1. Re-run the readiness check (or use the cached result if <10
+          min old).
+       2. If ALL criteria are green → POST /scenarios/4509808/run via
+          the Make API.
+       3. If ANY criterion is failing → REFUSE and instruct manual
+          review + manual triggering in Make.
+   - Authorised operators (Hargo, 13/05/2026):
+       - Hargo (U01DMHVF8KG)
+       - Charlotte Platt (U09N2EEBTHA)
+       - Omer Toker (U09FBNM8AMS)
+     Anyone outside this set gets redirected to one of the authorised
+     operators + the Make URL.
+   - Manual trigger is always an option if the operator has reconciled
+     the risk themselves.
+   - Volume signal: count of rows in `pending_late_fees` × ~£29 per
+     LPF gives the total cash impact for the day.
+   - Older Apply Fees scenario `4454366` (same URL pattern) exists in
+     history. Use 4509808 as the current production trigger.
+
+b. **Change Team Status / Send Notice**
+   - Scenario ID: `5480471`
+   - URL: https://eu1.make.com/74172/scenarios/5480471/edit
+   - Purpose: updates the agreement's `TeamStatus` in Anchor (e.g.
+     "1 Payment Missed" → "2 Payments Missed") and triggers the NODS
+     email via Sentinel.
+   - **Chains automatically** from the Apply Fees scenario (4509808) and
+     other upstream LPF scenarios — no manual trigger needed. Billington
+     should NOT tell operators to run this after applying fees.
+   - If this scenario fails, NODS coverage drops below 100% and
+     Billington's 15:00 Notices QA report flags the gap.
+
+
+5. Escalation criteria and contacts
+-----------------------------------
+- **Soft fail (data not ready by 12:30)**
+  - Continue auto-rechecking via the 08:40 cron.
+  - Note in #data-billing-updates that the day is at risk.
+
+- **Hard fail (data still not ready by 14:00)**
+  - Escalate to the data strategy team. Primary contacts:
+    - Tom Sullivan (Strategic Finance Manager, U089R04AB39)
+    - Diego Guajardo (Head of Strategic Finance, U06927U0VA6)
+  - Decision usually involves: defer to next working day OR apply
+    a partial subset that's known-good (e.g. exclude any agreements
+    touching the problematic data source).
+
+- **Pipeline issue (specific table not refreshing)**
+  - Raise an Aryza ticket (LCSDL-…) for `paymentservices_anchor`
+    issues. Reference recurring tickets if applicable.
+  - Tag IT / data engineering on the same day.
+
+- **NEVER apply LPFs when**
+  - ARUDD < 95% reconciled.
+  - Today's collection bounce rate is < 30% of 6-week average (almost
+    always means the ARUDD file is incomplete).
+  - Source tables (any of the four) haven't updated today.
+  - Yesterday's LPFs were incorrectly applied and not yet reversed.
+  - The duplicate-funder pattern (24/04/2026) is detected in
+    `stg_landing_sentinel_s3db01__funders` — a deduplication issue
+    upstream that causes the same LPF to be queued twice for the same
+    agreement.
+
+
+6. Post-application validation
+------------------------------
+After both Make scenarios run:
+
+a. **LPF count** — query `pending_late_fees` for today; rows should
+   have dropped to ~0 once the Apply Fees scenario completes.
+b. **Anchor TypeId 49 count** — sum of TypeId 49 entries posted today
+   should match the count that was pending.
+c. **NODS coverage** — Billington's 15:00 Notices QA report should
+   show NODS coverage at 100% (or near it). Anything below 95% needs
+   investigation.
+d. **Customer-impact spot check** — pick 2–3 random agreements that
+   had an LPF applied and verify the customer's TeamStatus updated
+   and the NODS email actually sent (via Sentinel logs).
+
+
+7. Known failure modes
+----------------------
+- **Duplicate funder rows** (24/04/2026): 466 LPFs applied twice
+  because `stg_landing_sentinel_s3db01__funders` had duplicate rows
+  per agreement. Workaround: dedup the source query before the LPF
+  queue is built. Bulk reversal was deferred to the following Monday
+  due to operational risk of a Friday-afternoon reversal.
+
+- **paymentservices_anchor stall** (28/04 – 04/05/2026): the upstream
+  Anchor source table stopped emitting updates, which cascaded into
+  BACS forecast accuracy and missing-instalment-due alerts. Aryza
+  ticket raised. Workaround was to fall back to manual data pulls
+  and skip the auto-forecast until the table caught up.
+
+- **Recollection file conflict** (28/04/2026): late fees and the
+  recollection file generation competed for the same processing
+  window. Hargo's decision was to prioritise the recollection file
+  and defer 1,061 LPFs; a one-cycle grace period was given to 597
+  agreements whose DDs were already in flight.
+
+- **Bank holiday weekends**: LPFs that would normally apply on a
+  bank holiday or weekend roll forward to the next working day,
+  combined with that day's regular LPFs. Volume tends to be higher,
+  push apply-time into the orange or red band on the BACS volume
+  indicator.
+
+- **NOSIA / SNOSIA email failures**: occasional cases where a notice
+  triggers but doesn't send. Billington's 15:00 Notices QA report
+  flags these individually for follow-up; usually a transient
+  Sentinel issue and rerunning the failed row resolves it.

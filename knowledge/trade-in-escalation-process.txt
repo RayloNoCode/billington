@@ -1,0 +1,51 @@
+## Trade-In Escalation Process
+
+Source: https://www.notion.so/Trade-In-Escalation-Process-2d15bb4b4a65808097bde70e7688cd80
+
+### Purpose
+Defines the process for handling trade-in disputes where a returned device cannot be located after confirmed delivery to the returns centre.
+
+### Ownership
+- Customer Success: customer communication, tracking, validation, refund processing
+- Risk Ops: fraud risk checks
+- Operations Director: final approval for escalated refunds
+
+### Customer Success Pathway (5 steps)
+1. **Device Return** — customer uses Raylo-provided returns method and retains proof of postage
+2. **Proof of Return Validation** — CS validates proof of postage receipt OR tracking link confirming delivery to Raylo warehouse
+3. **Delivery Confirmation & Waiting Period** — mandatory 30-day waiting period after delivery confirmed (allows warehouse intake and device reconciliation)
+4. **Pre-Escalation Checks (during 30-day period)**:
+   - Confirm this is the customer's FIRST trade-in device (check Forest — all subscriptions)
+   - If customer has had a previous trade-in, confirm if successful or previously escalated
+   - Risk Ops: confirm delivery address has NOT previously received a Raylo device addressed to a different customer
+   - CS requests Risk Ops check via Intercom internal note → Risk Ops Fraud bucket → findings returned to CS
+5. **Post-14 Day Review** — CS confirms device cannot be physically located AND trade-in status in Forest remains "Declared"
+
+### Escalation Pathway
+1. CS submits refund request for full trade-in value in Support Hub
+2. Internal approvals obtained per agreed thresholds; escalations tracked at: https://docs.google.com/spreadsheets/d/1yfCM_yE24hVM9OLZcs9s_DrymjEr4jE5aZKCxInWqYI/edit?gid=1383121629
+3. CS processes refund via #customer-refunds-complaints; CS Lead/Manager approves if all 5 CS Pathway steps met; Operations Director tagged for visibility
+4. If CS Pathway steps are NOT all met but refund is still requested → Operations Director approval required
+5. CS communicates outcome and expected timeline to customer; case formally closed
+
+### Billington Refund Pre-Checks (MANDATORY before posting any GOGW or processing refund)
+Before posting a GOGW (TypeId 61) or processing any trade-in refund on an agreement, Billington MUST check the Anchor agreement for the following blocking transaction types:
+
+| Check | TypeId(s) | Label |
+|---|---|---|
+| Asset returned | 30 | Asset returned |
+| Non-return fee | 28, 63, 64 | Non-return fee (Card), Non-return fee due, Non-return fee applied |
+| Asset purchased | 34 | Asset purchased |
+| Write-off | 26, 70 | Write-off, Debt sale write-off |
+| Asset lost in transit | 46 | Asset lost in transit |
+
+If ANY of these TypeIds exist on the agreement, Billington MUST NOT post the GOGW. Instead, escalate immediately to Charlotte Platt (@Charlotte Platt) or Hargo with the specific transaction found.
+
+Also check for an existing GOGW (TypeId 61) since the request date — if already posted, do not post again.
+
+### Arrears Check (MANDATORY)
+Before posting a GOGW, check TotalArrears on the Anchor agreement:
+- If TotalArrears > 0: ASK the requester whether to (a) post the GOGW now to offset the arrears, or (b) wait for the customer to clear their arrears first
+- If they choose to wait: set a 3-working-day reminder to recheck whether arrears have been cleared
+- If they choose to post now: proceed with posting the GOGW
+- If TotalArrears = 0: proceed immediately

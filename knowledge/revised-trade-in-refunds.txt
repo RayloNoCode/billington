@@ -1,0 +1,93 @@
+Revised Trade-In Refund — Reference
+===================================
+
+What it is
+----------
+A refund pattern distinct from a standard trade-in cashback GOGW.
+
+Standard trade-in:
+  Customer declares device → Ingram assesses → assessment matches the
+  declaration → cashback flows on the original declared amount across
+  the term.
+
+Revised trade-in (this document):
+  1. Customer declares device at amount A (e.g. £25.17/mo × 12 = £302.04).
+  2. Ingram assesses and revises the offer down to amount B
+     (e.g. £12.58/mo × 12 = £150.96).
+  3. Customer DECLINES the revised offer (does not consent to keep the
+     trade-in at the lower value).
+  4. Despite the declination, Ingram pushes the device to stock anyway.
+     The customer cannot recover the device.
+  5. To make the customer whole, Raylo refunds the DIFFERENCE
+     (A − B) — i.e. the cashback they were promised at declaration
+     versus what they would have got at the revised offer they did
+     not accept.
+
+How to recognise it
+-------------------
+Thread-side signals (any/all of these):
+  - 'revised offer'
+  - 'declined the revised'
+  - 'cust declined trade in revised offer'
+  - 'pushed to stock' / 'processed anyway' / 'already in stock'
+  - Two trade-in £ amounts present (declared + revised/accessed) plus an
+    explicit 'difference' line.
+  - Phrasings: 'Smart declared' (or 'Customer declared'),
+               'Smart accessed' (or 'Accessed' / 'Revised').
+
+Math
+----
+Refund amount = declared total − revised/accessed total.
+Always validate this arithmetic against any stated 'difference' value
+in the thread. Mistakes here are common — see the 06/05/2026 thread
+where Laura's stated £161.08 differed from the actual £302.04 − £150.96
+= £151.08 by £10.
+
+GOGW posting
+------------
+Post a single TypeId 61 transaction at the difference amount, NOT the
+declared total or the revised total alone. Notes:
+  'Trade-in revised difference refund — declared £A, accessed £B, difference £C'
+This makes the audit trail searchable and distinguishes these from
+standard trade-in cashback GOGWs in Anchor.
+
+Required evidence before posting
+--------------------------------
+1. Customer declination of the revised offer (explicit, in thread).
+2. Operational signal that Ingram processed the trade-in regardless
+   ('pushed to stock', 'in stock', 'already processed').
+3. Arithmetic reconciles: declared − revised = stated difference.
+4. Where Denton's block exposes both declared and revised/accessed
+   totals, those should also reconcile against the thread numbers.
+
+Refuse to post if:
+  - Arithmetic doesn't reconcile (off by more than 1p).
+  - Denton's declared/accessed differ from the thread amounts by more
+    than 1p (and Denton is the source of truth for trade-in totals).
+  - Either declination evidence or pushed-to-stock evidence is missing
+    — flag and ask for confirmation rather than guessing.
+
+Closed state
+------------
+Same as standard trade-in: TypeId 61 (GOGW at the difference) plus
+TypeId 149 (refund bank transfer) both posted, with no outstanding
+TypeId 62 / TypeId 35 reversals. Closed-state detection in the
+'confirm next steps' flow uses the same matching rule — just with the
+difference as the amount to compare against.
+
+Examples (from real threads)
+----------------------------
+A00342912 (06/05/2026, math correct):
+  Declared £23.08/mo × 12 = £276.96
+  Revised  £9.23/mo  × 12 = £110.76
+  Difference          = £166.20  ✓
+  → Post TypeId 61 of £166.20 with revised-difference notes.
+
+A00349302 (06/05/2026, team math wrong):
+  Declared £25.17/mo × 12 = £302.04
+  Revised  £12.58/mo × 12 = £150.96
+  Stated difference   = £161.08  ✗
+  Computed difference = £151.08
+  £10 mismatch.
+  → Refuse to post until corrected. Surface both numbers and ask
+    which is right.
