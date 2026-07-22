@@ -20110,6 +20110,39 @@ async function catchUpBalanceChecks() {
 }
 setTimeout(() => { catchUpBalanceChecks(); }, 60000); // once, 60s after boot
 
+// Startup catch-up for the daily hire-agreement audit
+// ---------------------------------------------------------------------------
+// The 13:00 audit is an in-process node-cron tick, which does NOT backfill a
+// missed run: if the process (re)starts across 13:00 on a weekday — e.g. a
+// deploy or a crash-restart near that window — the day is silently skipped
+// (this bit us on 21/07/2026 after a mid-day redeploy). Unlike the 16:00/17:00
+// campaigns, a daily COMPLIANCE audit must not skip a day, so recover it on
+// boot: if it's a weekday, 13:00 has passed, and today's card isn't already in
+// the channel, run it once. Channel-guarded so a redeploy never double-posts.
+async function catchUpDailyHireAgreementAudits() {
+  try {
+    const today = new Date().toLocaleDateString("en-CA", { timeZone: "Europe/London" });
+    const dow = new Date(`${today}T12:00:00Z`).getUTCDay(); // 0=Sun … 6=Sat
+    if (dow === 0 || dow === 6) return; // audit runs Mon–Fri only (matches "0 13 * * 1-5")
+    const hhmm = new Date().toLocaleTimeString("en-GB", { timeZone: "Europe/London", hour12: false, hour: "2-digit", minute: "2-digit" });
+    const [h, m] = hhmm.split(":").map(Number);
+    if ((h * 60 + m) < 13 * 60) return; // before 13:00 — let the cron fire normally
+    // Idempotency: skip if today's audit is already in the channel (every card
+    // contains "Newest agreement ID"). If none today, the 13:00 run was missed.
+    const hist = await app.client.conversations.history({ token: SLACK_BOT_TOKEN, channel: CHANNELS.HIRE_AGREEMENT_AUDIT, limit: 30 });
+    const postedToday = (hist.messages || []).some(msg =>
+      msg.bot_id && (msg.text || "").includes("Newest agreement ID") &&
+      new Date(Number(msg.ts) * 1000).toLocaleDateString("en-CA", { timeZone: "Europe/London" }) === today
+    );
+    if (postedToday) return;
+    console.log(`[bill-ling] Catch-up: 13:00 hire-agreement audit missing for ${today} — running now.`);
+    await postDailyHireAgreementAudits();
+  } catch (err) {
+    console.error("[bill-ling] catchUpDailyHireAgreementAudits error:", err.message);
+  }
+}
+setTimeout(() => { catchUpDailyHireAgreementAudits(); }, 75000); // once, ~75s after boot (staggered after balance catch-up)
+
 // ---------------------------------------------------------------------------
 // Cron: hourly — Aryza inbox poll
 // Every hour at :00, scan billingoperations@ for any new Aryza emails
