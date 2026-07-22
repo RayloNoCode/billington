@@ -1,6 +1,7 @@
 {
   "name": "bill-ling",
   "version": "1.0.0",
+  "private": true,
   "description": "Bill Ling \u2013 AI direct report Slack bot for Hargo (Raylo Ops & Billing)",
   "main": "index.js",
   "scripts": {
@@ -35,6 +36,8 @@
   "overrides": {
     "axios": "^1.18.0",
     "ws": "^8.21.0",
-    "form-data": "^4.0.6"
+    "form-data": "^4.0.6",
+    "path-to-regexp@0.1.12": "0.1.13",
+    "path-to-regexp@8.3.0": "8.4.0"
   }
 }

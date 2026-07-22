@@ -2,7 +2,7 @@
 #  - Slack Socket Mode = persistent WebSocket -> min-instances>=1 + CPU always allocated.
 #  - node-cron in-process schedules need the same always-on config.
 #  - Express health server listens on PORT (Cloud Run injects it).
-FROM node:22-slim
+FROM node:22-trixie-slim
 
 WORKDIR /app
 
