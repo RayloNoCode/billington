@@ -20132,7 +20132,7 @@ async function postBatchEscRefundPreflight({ channel, threadTs, user, amount, id
     `• Each: *${gbpFmt(amount)}* — GOGW (TypeId 61) + refund (TypeId 149), category *${BATCH_ESC_REFUND_CATEGORY}*`,
     `• Total if all post: *${gbpFmt(total)}*`,
     ``,
-    `Nothing has posted to Anchor yet. Test on the first ${testIds.length} (${testIds.join(", ")}), eyeball the result, then process the remaining in batches of 10. Any agreement that already has a refund is skipped automatically. ${BILLINGTON_REFUND_AUTHORISER_NAMES} only.`,
+    `Nothing has posted to Anchor yet. Test on the first ${testIds.length} (${testIds.join(", ")}), eyeball the result, then process the remaining in batches of 10. Any agreement that already has a refund is skipped, and any customer *in arrears is held* (not refunded). ${BILLINGTON_REFUND_AUTHORISER_NAMES} only.`,
   ].join("\n");
   const blocks = [
     { type: "section", text: { type: "mrkdwn", text } },
@@ -20153,43 +20153,58 @@ async function postBatchEscRefundPreflight({ channel, threadTs, user, amount, id
 // executeBillingtonAutoApprovedRefund's thread-level idempotency guard (#2) scans the
 // thread for those and would refuse the next agreement mid-loop.
 async function runBatchEscalationRefunds({ client, channel, threadTs, user, ids, amount, chunkSize }) {
-  const posted = [], skipped = [], failed = [];
+  const posted = [], skipped = [], held = [], failed = [];
   const chunks = [];
   for (let i = 0; i < ids.length; i += chunkSize) chunks.push(ids.slice(i, i + chunkSize));
   for (let ci = 0; ci < chunks.length; ci++) {
     for (const agId of chunks[ci]) {
-      try {
-        const r = await executeBillingtonAutoApprovedRefund({
-          channel, thread_ts: threadTs, user,
-          auditCtx: { requestedByUserId: user, triggeredBy: user, triggerSource: "slack_button", actionTypeSuffix: "batch_escalation" },
-          overrideAmount: amount, overrideCategory: BATCH_ESC_REFUND_CATEGORY, overrideAgreementId: agId,
-        });
-        if (r && r.fatal) {
-          if (/already (shows|has a posted)|already processed|already been processed/i.test(r.fatal)) skipped.push(agId);
-          else failed.push(`\`${agId}\`: ${r.fatal.slice(0, 140)}`);
-        } else if (r && r.refund && r.refund.status === "posted") {
-          posted.push(agId);
-        } else {
-          const gs = r && r.gogw ? r.gogw.status : "?";
-          const rs = r && r.refund ? r.refund.status : "?";
-          failed.push(`\`${agId}\`: GOGW ${gs} / refund ${rs} — manual review`);
-        }
-      } catch (e) { failed.push(`\`${agId}\`: ${e.message}`); }
+      // Arrears hold (Hargo, 23/07/2026): if the customer still owes Raylo, HOLD OFF —
+      // don't refund cash to an account in arrears (and Anchor may offset the refund
+      // against the arrears anyway). Live TotalArrears > 0 = owes. Unreadable → hold too
+      // (safer to flag for manual review than to refund blind).
+      let arrears = null, arrErr = null;
+      try { arrears = await getAgreementLiveTotalArrears(agId); } catch (e) { arrErr = e.message; }
+      if (arrErr || arrears === null) {
+        held.push(`\`${agId}\`: arrears unreadable${arrErr ? ` (${arrErr.slice(0, 60)})` : ""} — check manually`);
+      } else if (arrears > 0.01) {
+        held.push(`\`${agId}\`: in arrears £${arrears.toFixed(2)}`);
+      } else {
+        try {
+          const r = await executeBillingtonAutoApprovedRefund({
+            channel, thread_ts: threadTs, user,
+            auditCtx: { requestedByUserId: user, triggeredBy: user, triggerSource: "slack_button", actionTypeSuffix: "batch_escalation" },
+            overrideAmount: amount, overrideCategory: BATCH_ESC_REFUND_CATEGORY, overrideAgreementId: agId,
+          });
+          if (r && r.fatal) {
+            if (/already (shows|has a posted)|already processed|already been processed/i.test(r.fatal)) skipped.push(agId);
+            else failed.push(`\`${agId}\`: ${r.fatal.slice(0, 140)}`);
+          } else if (r && r.refund && r.refund.status === "posted") {
+            posted.push(agId);
+          } else {
+            const gs = r && r.gogw ? r.gogw.status : "?";
+            const rs = r && r.refund ? r.refund.status : "?";
+            failed.push(`\`${agId}\`: GOGW ${gs} / refund ${rs} — manual review`);
+          }
+        } catch (e) { failed.push(`\`${agId}\`: ${e.message}`); }
+      }
       await new Promise(res => setTimeout(res, 400)); // throttle Anchor
     }
     if (chunks.length > 1) {
       await client.chat.postMessage({ token: SLACK_BOT_TOKEN, channel, thread_ts: threadTs,
-        text: `Batch ${ci + 1}/${chunks.length} finished — running total: ✅ ${posted.length} refunded · ⏭️ ${skipped.length} already actioned · ❌ ${failed.length} failed.`,
+        text: `Batch ${ci + 1}/${chunks.length} finished - running total: ✅ ${posted.length} refunded · ⏭️ ${skipped.length} already actioned · ✋ ${held.length} held (arrears) · ❌ ${failed.length} failed.`,
         mrkdwn: true, unfurl_links: false, unfurl_media: false }).catch(() => {});
     }
   }
-  return { posted, skipped, failed };
+  return { posted, skipped, held, failed };
 }
 
 function summariseBatchEscRefund(res, runLabel, user, amount) {
-  const emoji = res.failed.length === 0 ? "✅" : "⚠️";
-  const lines = [`${emoji} *${runLabel}* — ${res.posted.length} refunded (${gbpFmt(amount)} each), ${res.skipped.length} already actioned (skipped), ${res.failed.length} failed. Run by <@${user}>.`];
+  const heldArr = res.held || [];
+  const clean = res.failed.length === 0 && heldArr.length === 0;
+  const emoji = clean ? "✅" : "⚠️";
+  const lines = [`${emoji} *${runLabel}* - ${res.posted.length} refunded (${gbpFmt(amount)} each), ${res.skipped.length} already actioned, ${heldArr.length} held (arrears), ${res.failed.length} failed. Run by <@${user}>.`];
   if (res.posted.length) lines.push(`Refunded: ${res.posted.slice(0, 40).map(a => `\`${a}\``).join(", ")}${res.posted.length > 40 ? ` +${res.posted.length - 40} more` : ""}.`);
+  if (heldArr.length) { lines.push(`✋ Held - customer in arrears, NOT refunded (action the arrears first, then re-run):`); lines.push(heldArr.slice(0, 40).join("\n")); if (heldArr.length > 40) lines.push(`… +${heldArr.length - 40} more.`); }
   if (res.skipped.length) lines.push(`⏭️ Skipped (already had a refund): ${res.skipped.slice(0, 40).map(a => `\`${a}\``).join(", ")}${res.skipped.length > 40 ? ` +${res.skipped.length - 40} more` : ""}.`);
   if (res.failed.length) { lines.push(`❌ Failed (manual review):`); lines.push(res.failed.slice(0, 25).join("\n")); if (res.failed.length > 25) lines.push(`… +${res.failed.length - 25} more.`); }
   return lines.join("\n");
