@@ -20165,9 +20165,9 @@ async function runBatchEscalationRefunds({ client, channel, threadTs, user, ids,
       let arrears = null, arrErr = null;
       try { arrears = await getAgreementLiveTotalArrears(agId); } catch (e) { arrErr = e.message; }
       if (arrErr || arrears === null) {
-        held.push(`\`${agId}\`: arrears unreadable${arrErr ? ` (${arrErr.slice(0, 60)})` : ""} — check manually`);
+        held.push({ id: agId, isArrears: false, arrears: null, reason: `arrears unreadable${arrErr ? ` (${arrErr.slice(0, 60)})` : ""} - check manually` });
       } else if (arrears > 0.01) {
-        held.push(`\`${agId}\`: in arrears £${arrears.toFixed(2)}`);
+        held.push({ id: agId, isArrears: true, arrears, reason: `in arrears £${arrears.toFixed(2)}` });
       } else {
         try {
           const r = await executeBillingtonAutoApprovedRefund({
@@ -20204,7 +20204,7 @@ function summariseBatchEscRefund(res, runLabel, user, amount) {
   const emoji = clean ? "✅" : "⚠️";
   const lines = [`${emoji} *${runLabel}* - ${res.posted.length} refunded (${gbpFmt(amount)} each), ${res.skipped.length} already actioned, ${heldArr.length} held (arrears), ${res.failed.length} failed. Run by <@${user}>.`];
   if (res.posted.length) lines.push(`Refunded: ${res.posted.slice(0, 40).map(a => `\`${a}\``).join(", ")}${res.posted.length > 40 ? ` +${res.posted.length - 40} more` : ""}.`);
-  if (heldArr.length) { lines.push(`✋ Held - customer in arrears, NOT refunded (action the arrears first, then re-run):`); lines.push(heldArr.slice(0, 40).join("\n")); if (heldArr.length > 40) lines.push(`… +${heldArr.length - 40} more.`); }
+  if (heldArr.length) { lines.push(`✋ Held, NOT refunded:`); lines.push(heldArr.slice(0, 40).map(h => `\`${h.id}\`: ${h.reason}`).join("\n")); if (heldArr.length > 40) lines.push(`… +${heldArr.length - 40} more.`); }
   if (res.skipped.length) lines.push(`⏭️ Skipped (already had a refund): ${res.skipped.slice(0, 40).map(a => `\`${a}\``).join(", ")}${res.skipped.length > 40 ? ` +${res.skipped.length - 40} more` : ""}.`);
   if (res.failed.length) { lines.push(`❌ Failed (manual review):`); lines.push(res.failed.slice(0, 25).join("\n")); if (res.failed.length > 25) lines.push(`… +${res.failed.length - 25} more.`); }
   return lines.join("\n");
@@ -20225,7 +20225,17 @@ app.action("btn_batch_escrefund_test", async ({ body, ack, client }) => {
     if (!ids.length || !(amount > 0)) { await client.chat.postEphemeral({ token: SLACK_BOT_TOKEN, channel: ch, user, text: `Couldn't read the test batch.` }); return; }
     await client.chat.postMessage({ token: SLACK_BOT_TOKEN, channel: ch, thread_ts: threadTs, text: `🧪 Testing on ${ids.length} agreement${ids.length === 1 ? "" : "s"} (${ids.join(", ")})…`, mrkdwn: true });
     const res = await runBatchEscalationRefunds({ client, channel: ch, threadTs, user, ids, amount, chunkSize: ids.length });
-    await client.chat.postMessage({ token: SLACK_BOT_TOKEN, channel: ch, thread_ts: threadTs, text: summariseBatchEscRefund(res, `Test on ${ids.length}`, user, amount) + `\n\nIf that looks right, press *▶️ Process (10 at a time)* above.`, mrkdwn: true, unfurl_links: false, unfurl_media: false });
+    const summary = summariseBatchEscRefund(res, `Test on ${ids.length}`, user, amount);
+    const arrearsHeldIds = (res.held || []).filter(h => h.isArrears).map(h => h.id);
+    let tail = `\n\nIf that looks right, press *▶️ Process (10 at a time)* above.`;
+    const elements = [];
+    if (arrearsHeldIds.length) {
+      tail += `\n💳 ${arrearsHeldIds.length} held for arrears. *Credit only (GOGW)* below credits them (offsets arrears, no refund) if the subscription isn't being cancelled.`;
+      elements.push(gogwCreditButton(amount, arrearsHeldIds));
+    }
+    const blocks = [{ type: "section", text: { type: "mrkdwn", text: summary + tail } }];
+    if (elements.length) blocks.push({ type: "actions", elements });
+    await client.chat.postMessage({ token: SLACK_BOT_TOKEN, channel: ch, thread_ts: threadTs, text: summary, blocks, mrkdwn: true, unfurl_links: false, unfurl_media: false });
   } catch (err) {
     console.error("[bill-ling] btn_batch_escrefund_test error:", err.message);
     try { await client.chat.postMessage({ token: SLACK_BOT_TOKEN, channel: ch, thread_ts: threadTs, text: `⚠️ Test hit an error: ${err.message}. Check the logs before processing the rest.`, mrkdwn: true }); } catch (_) {}
@@ -20258,23 +20268,114 @@ app.action("btn_batch_escrefund_run", async ({ body, ack, client }) => {
     } catch (_) {}
     const res = await runBatchEscalationRefunds({ client, channel: ch, threadTs, user, ids: thisBatch, amount, chunkSize: thisBatch.length });
     const summary = summariseBatchEscRefund(res, `Batch of ${thisBatch.length}`, user, amount);
+    const arrearsHeldIds = (res.held || []).filter(h => h.isArrears).map(h => h.id);
+    const elements = [];
+    let tail = "";
     if (remaining.length) {
       const nextN = Math.min(BATCH, remaining.length);
-      const blocks = [
-        { type: "section", text: { type: "mrkdwn", text: `${summary}\n\n*${remaining.length} still to process.* Press below when ready for the next ${nextN}.` } },
-        { type: "actions", elements: [
-          { type: "button", text: { type: "plain_text", text: `▶️ Process next ${nextN} (${remaining.length} left)`, emoji: true }, style: "primary",
-            action_id: "btn_batch_escrefund_run", value: JSON.stringify({ amount, ids: remaining }),
-            confirm: { title: { type: "plain_text", text: "Process next batch?" }, text: { type: "mrkdwn", text: `Processes the next ${nextN} of ${remaining.length} remaining. Already-refunded are skipped, in-arrears are held. Real money.` }, confirm: { type: "plain_text", text: "Process" }, deny: { type: "plain_text", text: "Cancel" } } },
-        ]},
-      ];
-      await client.chat.postMessage({ token: SLACK_BOT_TOKEN, channel: ch, thread_ts: threadTs, text: summary, blocks, mrkdwn: true, unfurl_links: false, unfurl_media: false });
+      tail += `\n\n*${remaining.length} still to process.* Press below when ready for the next ${nextN}.`;
+      elements.push({ type: "button", text: { type: "plain_text", text: `▶️ Process next ${nextN} (${remaining.length} left)`, emoji: true }, style: "primary",
+        action_id: "btn_batch_escrefund_run", value: JSON.stringify({ amount, ids: remaining }),
+        confirm: { title: { type: "plain_text", text: "Process next batch?" }, text: { type: "mrkdwn", text: `Processes the next ${nextN} of ${remaining.length} remaining. Already-refunded are skipped, in-arrears are held. Real money.` }, confirm: { type: "plain_text", text: "Process" }, deny: { type: "plain_text", text: "Cancel" } } });
     } else {
-      await client.chat.postMessage({ token: SLACK_BOT_TOKEN, channel: ch, thread_ts: threadTs, text: `${summary}\n\n✅ That was the last batch — all agreements processed.`, mrkdwn: true, unfurl_links: false, unfurl_media: false });
+      tail += `\n\n✅ That was the last batch.`;
     }
+    if (arrearsHeldIds.length) {
+      tail += `\n💳 ${arrearsHeldIds.length} held for arrears. Use *Credit only (GOGW)* below to credit them (offsets arrears, no refund) if the subscription isn't being cancelled.`;
+      elements.push(gogwCreditButton(amount, arrearsHeldIds));
+    }
+    const blocks = [{ type: "section", text: { type: "mrkdwn", text: summary + tail } }];
+    if (elements.length) blocks.push({ type: "actions", elements });
+    await client.chat.postMessage({ token: SLACK_BOT_TOKEN, channel: ch, thread_ts: threadTs, text: summary, blocks, mrkdwn: true, unfurl_links: false, unfurl_media: false });
   } catch (err) {
     console.error("[bill-ling] btn_batch_escrefund_run error:", err.message);
     try { await client.chat.postMessage({ token: SLACK_BOT_TOKEN, channel: ch, thread_ts: threadTs, text: `⚠️ Batch run hit an error: ${err.message}. Some may not have processed — check the summary/logs.`, mrkdwn: true }); } catch (_) {}
+  }
+});
+
+// "💳 Credit only (GOGW)" — for agreements HELD for arrears where the sub is NOT being
+// cancelled (Hargo, 23/07/2026): post a GOGW (TypeId 61) only, no refund, so the credit
+// knocks the amount off the customer's arrears. Idempotent: skips if a GOGW is already on
+// Anchor (dated today+, e.g. a prior timing-failure) and skips any agreement no longer in
+// arrears (state may have changed). NEVER posts a refund. Authoriser-gated.
+function gogwCreditButton(amount, ids) {
+  return { type: "button", text: { type: "plain_text", text: `💳 Credit only (GOGW) - ${ids.length} in arrears`, emoji: true },
+    action_id: "btn_batch_gogw_credit", value: JSON.stringify({ amount, ids }),
+    confirm: { title: { type: "plain_text", text: "Post GOGW credit only?" }, text: { type: "mrkdwn", text: `Posts a ${gbpFmt(amount)} GOGW (TypeId 61, credit) to the ${ids.length} in-arrears agreement(s) to offset their arrears. *No refund.* Skips any that already have a GOGW or are no longer in arrears. Use only when the subscription is NOT being cancelled.` }, confirm: { type: "plain_text", text: "Post GOGW" }, deny: { type: "plain_text", text: "Cancel" } } };
+}
+
+async function runBatchGogwOnly({ channel, threadTs, user, ids, amount }) {
+  const credited = [], skippedNoArrears = [], alreadyGogw = [], failed = [];
+  const today = new Date().toLocaleDateString("en-CA", { timeZone: "Europe/London" });
+  for (const agId of ids) {
+    try {
+      // Only credit accounts still genuinely in arrears (state may have moved since the batch).
+      let arrears = null; try { arrears = await getAgreementLiveTotalArrears(agId); } catch (_) {}
+      if (arrears === null) { failed.push(`\`${agId}\`: arrears unreadable - check manually`); await new Promise(r => setTimeout(r, 400)); continue; }
+      if (arrears <= 0.01) { skippedNoArrears.push(agId); await new Promise(r => setTimeout(r, 400)); continue; }
+      // Idempotent: skip if an unreversed GOGW (net TypeId 61 - 62) is already on Anchor dated today+.
+      let hasGogw = false;
+      try {
+        const gx = await getAgreementFromAnchor(agId);
+        const gblocks = gx.match(/<(?:a:)?Transaction>[\s\S]*?<\/(?:a:)?Transaction>/g) || [];
+        let p = 0, rv = 0;
+        for (const blk of gblocks) {
+          const tm = blk.match(/<(?:a:)?TypeId>(\d+)<\/(?:a:)?TypeId>/); if (!tm) continue;
+          const tid = parseInt(tm[1], 10); if (tid !== 61 && tid !== 62) continue;
+          const dm = blk.match(/<(?:a:)?TransactionDate>([^<]+)<\/(?:a:)?TransactionDate>/);
+          const d = dm ? dm[1].slice(0, 10) : null; if (d && d < today) continue;
+          const am = blk.match(/<(?:a:)?Amount>([^<]+)<\/(?:a:)?Amount>/); const a = am ? Math.abs(parseFloat(am[1])) : 0;
+          if (tid === 61) p += a; else rv += a;
+        }
+        if (p - rv > 0.01) hasGogw = true;
+      } catch (_) { /* can't read - let the post run */ }
+      if (hasGogw) { alreadyGogw.push(agId); await new Promise(r => setTimeout(r, 400)); continue; }
+      await addTransactionToAnchor(agId, today, amount, `Escalation resolution GOGW - credit to offset arrears, no refund (Billington batch).`.slice(0, 150), 61, {
+        requestedByUserId: user, triggeredBy: user, triggerSource: "slack_button", actionType: "gogw_posted",
+        description: `GOGW credit only £${amount.toFixed(2)} (offset arrears, no refund) on ${agId}`,
+        idempotencyKey: `gogw_credit_only:${agId}:${today}`,
+      });
+      credited.push(agId);
+    } catch (e) { failed.push(`\`${agId}\`: ${e.message}`); }
+    await new Promise(r => setTimeout(r, 400)); // throttle Anchor
+  }
+  return { credited, skippedNoArrears, alreadyGogw, failed };
+}
+
+function summariseGogwCredit(res, user, amount) {
+  const clean = res.failed.length === 0;
+  const lines = [`${clean ? "✅" : "⚠️"} *GOGW credit (no refund)* - ${res.credited.length} credited ${gbpFmt(amount)} each, ${res.alreadyGogw.length} already had a GOGW, ${res.skippedNoArrears.length} no longer in arrears, ${res.failed.length} failed. By <@${user}>.`];
+  if (res.credited.length) lines.push(`Credited (knocked off arrears): ${res.credited.map(a => `\`${a}\``).join(", ")}.`);
+  if (res.alreadyGogw.length) lines.push(`⏭️ Already had a GOGW (skipped): ${res.alreadyGogw.map(a => `\`${a}\``).join(", ")}.`);
+  if (res.skippedNoArrears.length) lines.push(`⏭️ No longer in arrears (skipped): ${res.skippedNoArrears.map(a => `\`${a}\``).join(", ")}.`);
+  if (res.failed.length) { lines.push(`❌ Failed:`); lines.push(res.failed.slice(0, 25).join("\n")); }
+  return lines.join("\n");
+}
+
+app.action("btn_batch_gogw_credit", async ({ body, ack, client }) => {
+  await ack();
+  const user = body.user?.id, ch = body.channel?.id, ts = body.message?.ts;
+  const threadTs = body.message?.thread_ts || ts;
+  try {
+    if (!BILLINGTON_REFUND_AUTHORISERS.has(user)) {
+      await client.chat.postEphemeral({ token: SLACK_BOT_TOKEN, channel: ch, user, text: `Only ${BILLINGTON_REFUND_AUTHORISER_NAMES} can post GOGW credits.` });
+      return;
+    }
+    let payload; try { payload = JSON.parse(body.actions?.[0]?.value || "{}"); } catch (_) { payload = {}; }
+    const ids = Array.isArray(payload.ids) ? payload.ids : [];
+    const amount = Number(payload.amount);
+    if (!ids.length || !(amount > 0)) { await client.chat.postEphemeral({ token: SLACK_BOT_TOKEN, channel: ch, user, text: `Couldn't read the credit batch.` }); return; }
+    // Disable the pressed button so it can't double-fire.
+    try {
+      const kept = (body.message?.blocks || []).filter(b => b.type !== "actions");
+      kept.push({ type: "context", elements: [{ type: "mrkdwn", text: `💳 Posting GOGW credit (no refund) to ${ids.length} (started by <@${user}>)…` }] });
+      await client.chat.update({ token: SLACK_BOT_TOKEN, channel: ch, ts, text: body.message?.text || "Posting GOGW credits.", blocks: kept });
+    } catch (_) {}
+    const res = await runBatchGogwOnly({ channel: ch, threadTs, user, ids, amount });
+    await client.chat.postMessage({ token: SLACK_BOT_TOKEN, channel: ch, thread_ts: threadTs, text: summariseGogwCredit(res, user, amount), mrkdwn: true, unfurl_links: false, unfurl_media: false });
+  } catch (err) {
+    console.error("[bill-ling] btn_batch_gogw_credit error:", err.message);
+    try { await client.chat.postMessage({ token: SLACK_BOT_TOKEN, channel: ch, thread_ts: threadTs, text: `⚠️ GOGW credit run hit an error: ${err.message}. Check the summary/logs.`, mrkdwn: true }); } catch (_) {}
   }
 });
 
