@@ -20096,6 +20096,154 @@ app.action("btn_run_custom_profiles", async ({ body, ack, client }) => {
   }
 });
 
+// ───────────────────────────────────────────────────────────────────────────
+// Batch escalation refunds (Hargo, 23/07/2026)
+// An authoriser posts "escalation refund £X each on A00… A00… …" in
+// #customer-refunds → Billington posts a pre-flight with two buttons: test on the
+// first 2, then process the remaining in batches of 10. Each agreement runs through
+// the proven executeBillingtonAutoApprovedRefund primitive with an override triple
+// (amount / "Escalation resolution" / id), so every live guard applies per agreement
+// — most importantly checkAnchorForRefund, which SKIPS an agreement already refunded,
+// so re-runs and the tested 2 are never double-refunded. Real money → authoriser-gated.
+const BATCH_ESC_REFUND_CATEGORY = "Escalation resolution";
+const gbpFmt = (n) => Number(n).toLocaleString("en-GB", { style: "currency", currency: "GBP" });
+
+function parseBatchEscalationRefundCommand(text) {
+  const t = String(text || "");
+  const m = t.match(/\b(?:batch\s+)?escalation\s+refund\s+(?:of\s+)?£?\s*([\d,]+(?:\.\d{1,2})?)\s*(?:each|per\s+agreement|ea|a\s+piece)?\s+on\b/i);
+  if (!m) return null;
+  const amount = parseFloat(m[1].replace(/,/g, ""));
+  if (!(amount > 0)) return null;
+  const ids = [...new Set((t.match(/\bA\d{5,9}\b/gi) || []).map(s => s.toUpperCase()))];
+  if (ids.length === 0) return null;
+  return { amount, ids };
+}
+
+async function postBatchEscRefundPreflight({ channel, threadTs, user, amount, ids }) {
+  if (ids.length > 150) {
+    await app.client.chat.postMessage({ token: SLACK_BOT_TOKEN, channel, thread_ts: threadTs, text: `That's ${ids.length} agreements — too many for one button (Slack's value limit). Please split into batches of ≤150 and post separate commands.`, mrkdwn: true });
+    return;
+  }
+  const total = amount * ids.length;
+  const testIds = ids.slice(0, 2);
+  const text = [
+    `*Batch escalation refund — pre-flight*`,
+    `• Agreements: *${ids.length}*`,
+    `• Each: *${gbpFmt(amount)}* — GOGW (TypeId 61) + refund (TypeId 149), category *${BATCH_ESC_REFUND_CATEGORY}*`,
+    `• Total if all post: *${gbpFmt(total)}*`,
+    ``,
+    `Nothing has posted to Anchor yet. Test on the first ${testIds.length} (${testIds.join(", ")}), eyeball the result, then process the remaining in batches of 10. Any agreement that already has a refund is skipped automatically. ${BILLINGTON_REFUND_AUTHORISER_NAMES} only.`,
+  ].join("\n");
+  const blocks = [
+    { type: "section", text: { type: "mrkdwn", text } },
+    { type: "actions", elements: [
+      { type: "button", text: { type: "plain_text", text: `🧪 Test on first ${testIds.length}`, emoji: true },
+        action_id: "btn_batch_escrefund_test", value: JSON.stringify({ amount, ids: testIds }),
+        confirm: { title: { type: "plain_text", text: "Test refund?" }, text: { type: "mrkdwn", text: `Posts GOGW ${gbpFmt(amount)} + refund ${gbpFmt(amount)} on the first ${testIds.length} agreements. Real money.` }, confirm: { type: "plain_text", text: "Test it" }, deny: { type: "plain_text", text: "Cancel" } } },
+      { type: "button", text: { type: "plain_text", text: `▶️ Process remaining (batches of 10)`, emoji: true }, style: "primary",
+        action_id: "btn_batch_escrefund_run", value: JSON.stringify({ amount, ids }),
+        confirm: { title: { type: "plain_text", text: "Process all?" }, text: { type: "mrkdwn", text: `Processes all ${ids.length} in batches of 10. Already-refunded agreements are skipped. Real money — up to ${gbpFmt(total)}.` }, confirm: { type: "plain_text", text: "Process" }, deny: { type: "plain_text", text: "Cancel" } } },
+    ]},
+  ];
+  await app.client.chat.postMessage({ token: SLACK_BOT_TOKEN, channel, thread_ts: threadTs, text: "Batch escalation refund pre-flight", blocks, mrkdwn: true, unfurl_links: false, unfurl_media: false });
+}
+
+// IMPORTANT: every message this posts to threadTs must AVOID the phrases
+// "Done. Posted on", "has been posted in Anchor" and "Marking as complete" —
+// executeBillingtonAutoApprovedRefund's thread-level idempotency guard (#2) scans the
+// thread for those and would refuse the next agreement mid-loop.
+async function runBatchEscalationRefunds({ client, channel, threadTs, user, ids, amount, chunkSize }) {
+  const posted = [], skipped = [], failed = [];
+  const chunks = [];
+  for (let i = 0; i < ids.length; i += chunkSize) chunks.push(ids.slice(i, i + chunkSize));
+  for (let ci = 0; ci < chunks.length; ci++) {
+    for (const agId of chunks[ci]) {
+      try {
+        const r = await executeBillingtonAutoApprovedRefund({
+          channel, thread_ts: threadTs, user,
+          auditCtx: { requestedByUserId: user, triggeredBy: user, triggerSource: "slack_button", actionTypeSuffix: "batch_escalation" },
+          overrideAmount: amount, overrideCategory: BATCH_ESC_REFUND_CATEGORY, overrideAgreementId: agId,
+        });
+        if (r && r.fatal) {
+          if (/already (shows|has a posted)|already processed|already been processed/i.test(r.fatal)) skipped.push(agId);
+          else failed.push(`\`${agId}\`: ${r.fatal.slice(0, 140)}`);
+        } else if (r && r.refund && r.refund.status === "posted") {
+          posted.push(agId);
+        } else {
+          const gs = r && r.gogw ? r.gogw.status : "?";
+          const rs = r && r.refund ? r.refund.status : "?";
+          failed.push(`\`${agId}\`: GOGW ${gs} / refund ${rs} — manual review`);
+        }
+      } catch (e) { failed.push(`\`${agId}\`: ${e.message}`); }
+      await new Promise(res => setTimeout(res, 400)); // throttle Anchor
+    }
+    if (chunks.length > 1) {
+      await client.chat.postMessage({ token: SLACK_BOT_TOKEN, channel, thread_ts: threadTs,
+        text: `Batch ${ci + 1}/${chunks.length} finished — running total: ✅ ${posted.length} refunded · ⏭️ ${skipped.length} already actioned · ❌ ${failed.length} failed.`,
+        mrkdwn: true, unfurl_links: false, unfurl_media: false }).catch(() => {});
+    }
+  }
+  return { posted, skipped, failed };
+}
+
+function summariseBatchEscRefund(res, runLabel, user, amount) {
+  const emoji = res.failed.length === 0 ? "✅" : "⚠️";
+  const lines = [`${emoji} *${runLabel}* — ${res.posted.length} refunded (${gbpFmt(amount)} each), ${res.skipped.length} already actioned (skipped), ${res.failed.length} failed. Run by <@${user}>.`];
+  if (res.posted.length) lines.push(`Refunded: ${res.posted.slice(0, 40).map(a => `\`${a}\``).join(", ")}${res.posted.length > 40 ? ` +${res.posted.length - 40} more` : ""}.`);
+  if (res.skipped.length) lines.push(`⏭️ Skipped (already had a refund): ${res.skipped.slice(0, 40).map(a => `\`${a}\``).join(", ")}${res.skipped.length > 40 ? ` +${res.skipped.length - 40} more` : ""}.`);
+  if (res.failed.length) { lines.push(`❌ Failed (manual review):`); lines.push(res.failed.slice(0, 25).join("\n")); if (res.failed.length > 25) lines.push(`… +${res.failed.length - 25} more.`); }
+  return lines.join("\n");
+}
+
+app.action("btn_batch_escrefund_test", async ({ body, ack, client }) => {
+  await ack();
+  const user = body.user?.id, ch = body.channel?.id, ts = body.message?.ts;
+  const threadTs = body.message?.thread_ts || ts;
+  try {
+    if (!BILLINGTON_REFUND_AUTHORISERS.has(user)) {
+      await client.chat.postEphemeral({ token: SLACK_BOT_TOKEN, channel: ch, user, text: `Only ${BILLINGTON_REFUND_AUTHORISER_NAMES} can run a batch escalation refund.` });
+      return;
+    }
+    let payload; try { payload = JSON.parse(body.actions?.[0]?.value || "{}"); } catch (_) { payload = {}; }
+    const ids = Array.isArray(payload.ids) ? payload.ids : [];
+    const amount = Number(payload.amount);
+    if (!ids.length || !(amount > 0)) { await client.chat.postEphemeral({ token: SLACK_BOT_TOKEN, channel: ch, user, text: `Couldn't read the test batch.` }); return; }
+    await client.chat.postMessage({ token: SLACK_BOT_TOKEN, channel: ch, thread_ts: threadTs, text: `🧪 Testing on ${ids.length} agreement${ids.length === 1 ? "" : "s"} (${ids.join(", ")})…`, mrkdwn: true });
+    const res = await runBatchEscalationRefunds({ client, channel: ch, threadTs, user, ids, amount, chunkSize: ids.length });
+    await client.chat.postMessage({ token: SLACK_BOT_TOKEN, channel: ch, thread_ts: threadTs, text: summariseBatchEscRefund(res, `Test on ${ids.length}`, user, amount) + `\n\nIf that looks right, press *▶️ Process remaining (batches of 10)* above.`, mrkdwn: true, unfurl_links: false, unfurl_media: false });
+  } catch (err) {
+    console.error("[bill-ling] btn_batch_escrefund_test error:", err.message);
+    try { await client.chat.postMessage({ token: SLACK_BOT_TOKEN, channel: ch, thread_ts: threadTs, text: `⚠️ Test hit an error: ${err.message}. Check the logs before processing the rest.`, mrkdwn: true }); } catch (_) {}
+  }
+});
+
+app.action("btn_batch_escrefund_run", async ({ body, ack, client }) => {
+  await ack();
+  const user = body.user?.id, ch = body.channel?.id, ts = body.message?.ts;
+  const threadTs = body.message?.thread_ts || ts;
+  try {
+    if (!BILLINGTON_REFUND_AUTHORISERS.has(user)) {
+      await client.chat.postEphemeral({ token: SLACK_BOT_TOKEN, channel: ch, user, text: `Only ${BILLINGTON_REFUND_AUTHORISER_NAMES} can run a batch escalation refund.` });
+      return;
+    }
+    let payload; try { payload = JSON.parse(body.actions?.[0]?.value || "{}"); } catch (_) { payload = {}; }
+    const ids = Array.isArray(payload.ids) ? payload.ids : [];
+    const amount = Number(payload.amount);
+    if (!ids.length || !(amount > 0)) { await client.chat.postEphemeral({ token: SLACK_BOT_TOKEN, channel: ch, user, text: `Couldn't read the batch.` }); return; }
+    // Disable both buttons immediately so a double-press can't kick off a second run.
+    try {
+      const kept = (body.message?.blocks || []).filter(b => b.type !== "actions");
+      kept.push({ type: "context", elements: [{ type: "mrkdwn", text: `▶️ Processing ${ids.length} in batches of 10 (started by <@${user}>)…` }] });
+      await client.chat.update({ token: SLACK_BOT_TOKEN, channel: ch, ts, text: body.message?.text || "Processing batch escalation refunds.", blocks: kept });
+    } catch (_) {}
+    const res = await runBatchEscalationRefunds({ client, channel: ch, threadTs, user, ids, amount, chunkSize: 10 });
+    await client.chat.postMessage({ token: SLACK_BOT_TOKEN, channel: ch, thread_ts: threadTs, text: summariseBatchEscRefund(res, `Batch escalation refund (${ids.length} in 10s)`, user, amount), mrkdwn: true, unfurl_links: false, unfurl_media: false });
+  } catch (err) {
+    console.error("[bill-ling] btn_batch_escrefund_run error:", err.message);
+    try { await client.chat.postMessage({ token: SLACK_BOT_TOKEN, channel: ch, thread_ts: threadTs, text: `⚠️ Batch run hit an error: ${err.message}. Some may not have processed — check the summary/logs.`, mrkdwn: true }); } catch (_) {}
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Startup catch-up for the daily balance checks
 // ---------------------------------------------------------------------------
@@ -21593,6 +21741,23 @@ async function handleMentionEvent(event, say) {
         await say({ text: `❌ Waive Log sync failed: ${err.message}`, thread_ts: thread_ts || ts });
       }
       return;
+    }
+
+    // Batch escalation-refund short-circuit (Hargo, 23/07/2026): an authoriser posts
+    // "escalation refund £X each on A00… A00… …" in #customer-refunds → Billington posts
+    // a pre-flight with a Test-on-2 and a Process-remaining-in-10s button. Nothing posts
+    // to Anchor until a button is pressed. Independent of the custom-profile campaign;
+    // it just reuses that UX shape. See runBatchEscalationRefunds.
+    {
+      const _batchCmd = parseBatchEscalationRefundCommand(cleanText);
+      if (_batchCmd && channel === CHANNELS.CUSTOMER_REFUNDS) {
+        if (!BILLINGTON_REFUND_AUTHORISERS.has(user)) {
+          await say({ text: `Only ${BILLINGTON_REFUND_AUTHORISER_NAMES} can run a batch escalation refund.`, thread_ts: thread_ts || ts });
+        } else {
+          await postBatchEscRefundPreflight({ channel, threadTs: thread_ts || ts, user, amount: _batchCmd.amount, ids: _batchCmd.ids });
+        }
+        return;
+      }
     }
 
     // Deterministic short-circuit: "approved @billington" in a refund-approval
