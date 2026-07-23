@@ -19973,6 +19973,14 @@ async function runCustomProfileCampaignPreflight() {
     await app.client.chat.postMessage({ token: SLACK_BOT_TOKEN, channel: CHANNELS.DATA_BILLING_UPDATES, text: `⚠️ Monthly custom-profile pre-flight query failed: ${err.message}. No profiles set up.`, mrkdwn: true, unfurl_links: false, unfurl_media: false });
     return;
   }
+  // Exclude agreements already set up via a manual test this month (Hargo, 23/07/2026)
+  // so the monthly run can never double-collect from a test agreement.
+  const testedThisMonth = new Set(((state.testedProfiles || {})[month]) || []);
+  if (testedThisMonth.size) {
+    const before = candidates.length;
+    candidates = candidates.filter(c => !testedThisMonth.has(c.agreementId));
+    if (before !== candidates.length) console.log(`[bill-ling] Custom-profile: excluded ${before - candidates.length} already-tested agreement(s) for ${month}.`);
+  }
   const count = candidates.length;
   const total = candidates.reduce((s, c) => s + c.amount, 0);
   // Each candidate's startDate is the full datetime from the query (sent verbatim in
@@ -20093,6 +20101,77 @@ app.action("btn_run_custom_profiles", async ({ body, ack, client }) => {
   } catch (err) {
     console.error("[bill-ling] btn_run_custom_profiles error:", err.message);
     try { await client.chat.postMessage({ token: SLACK_BOT_TOKEN, channel: ch, thread_ts: ts, text: `⚠️ Custom-profile run hit an error: ${err.message}. Some profiles may not have been set up, check the logs.`, mrkdwn: true }); } catch (_) {}
+  }
+});
+
+// Single-agreement custom-profile TEST (Hargo, 23/07/2026): an authoriser types "test
+// custom profile [on A00…]" → pick one live candidate (the named one, or the smallest-
+// arrears for a low-risk test) and post a pre-flight with a Run button. Sets up ONE Anchor
+// SetupCustomProfile, then records it so the monthly run EXCLUDES it (no double-collection).
+async function postCustomProfileTestPreflight({ channel, threadTs, user, requestedId }) {
+  const gbp = (n) => Number(n).toLocaleString("en-GB", { style: "currency", currency: "GBP" });
+  let candidates;
+  try { candidates = await queryCustomProfileCandidates(); }
+  catch (e) { await app.client.chat.postMessage({ token: SLACK_BOT_TOKEN, channel, thread_ts: threadTs, text: `⚠️ Couldn't query custom-profile candidates: ${e.message}`, mrkdwn: true }); return; }
+  if (!candidates.length) { await app.client.chat.postMessage({ token: SLACK_BOT_TOKEN, channel, thread_ts: threadTs, text: `No custom-profile candidates are in scope right now, so there's nothing to test.`, mrkdwn: true }); return; }
+  let pick;
+  if (requestedId) {
+    pick = candidates.find(c => c.agreementId.toUpperCase() === requestedId.toUpperCase());
+    if (!pick) { await app.client.chat.postMessage({ token: SLACK_BOT_TOKEN, channel, thread_ts: threadTs, text: `${requestedId.toUpperCase()} isn't in the current custom-profile candidate list (${candidates.length} in scope), so I won't test it. Say *test custom profile* and I'll pick the smallest-amount one.`, mrkdwn: true }); return; }
+  } else {
+    pick = [...candidates].sort((a, b) => a.amount - b.amount)[0]; // smallest amount = lowest-risk test
+  }
+  const startDateDisplay = (pick.startDate || "").slice(0, 10);
+  const text = [
+    `*Custom-profile test — 1 agreement*`,
+    `• Agreement: *${pick.agreementId}*`,
+    `• Amount: *${gbp(pick.amount)}* (supplement DD, one working-day payment, removed when complete)`,
+    `• Start date: *${fmtDate(startDateDisplay)}*`,
+    ``,
+    `Sets up ONE Anchor SetupCustomProfile as a live test${requestedId ? "" : " (smallest-amount candidate — lowest risk)"}. It's recorded and *excluded from the monthly run* so it can't be double-collected. ${BILLINGTON_REFUND_AUTHORISER_NAMES} only.`,
+  ].join("\n");
+  const blocks = [
+    { type: "section", text: { type: "mrkdwn", text } },
+    { type: "actions", elements: [
+      { type: "button", text: { type: "plain_text", text: `▶️ Set up this 1 profile`, emoji: true }, style: "primary",
+        action_id: "btn_test_custom_profile", value: JSON.stringify({ agreementId: pick.agreementId, amount: pick.amount, startDate: pick.startDate }),
+        confirm: { title: { type: "plain_text", text: "Set up custom profile?" }, text: { type: "mrkdwn", text: `Posts a SetupCustomProfile to Anchor for ${pick.agreementId} (${gbp(pick.amount)}). Real Direct Debit re-collection.` }, confirm: { type: "plain_text", text: "Set it up" }, deny: { type: "plain_text", text: "Cancel" } } },
+    ]},
+  ];
+  await app.client.chat.postMessage({ token: SLACK_BOT_TOKEN, channel, thread_ts: threadTs, text: "Custom-profile test pre-flight", blocks, mrkdwn: true, unfurl_links: false, unfurl_media: false });
+}
+
+app.action("btn_test_custom_profile", async ({ body, ack, client }) => {
+  await ack();
+  const user = body.user?.id, ch = body.channel?.id, ts = body.message?.ts;
+  const threadTs = body.message?.thread_ts || ts;
+  const gbp = (n) => Number(n).toLocaleString("en-GB", { style: "currency", currency: "GBP" });
+  try {
+    if (!BILLINGTON_REFUND_AUTHORISERS.has(user)) { await client.chat.postEphemeral({ token: SLACK_BOT_TOKEN, channel: ch, user, text: `Only ${BILLINGTON_REFUND_AUTHORISER_NAMES} can run a custom-profile test.` }); return; }
+    let p; try { p = JSON.parse(body.actions?.[0]?.value || "{}"); } catch (_) { p = {}; }
+    const { agreementId, amount, startDate } = p;
+    if (!agreementId || !(Number(amount) > 0) || !startDate) { await client.chat.postEphemeral({ token: SLACK_BOT_TOKEN, channel: ch, user, text: `Couldn't read the test details.` }); return; }
+    try {
+      const kept = (body.message?.blocks || []).filter(b => b.type !== "actions");
+      kept.push({ type: "context", elements: [{ type: "mrkdwn", text: `▶️ Setting up custom profile for ${agreementId} (by <@${user}>)…` }] });
+      await client.chat.update({ token: SLACK_BOT_TOKEN, channel: ch, ts, text: body.message?.text || "Setting up custom profile.", blocks: kept });
+    } catch (_) {}
+    let r; try { r = await anchorSetupCustomProfile(agreementId, amount, startDate); } catch (e) { r = { ok: false, detail: e.message }; }
+    if (r.ok) {
+      try {
+        const month = new Date().toLocaleDateString("en-CA", { timeZone: "Europe/London" }).slice(0, 7);
+        const state = (await loadJsonFromGcs(CUSTOM_PROFILE_STATE_GCS_KEY)) || {};
+        state.testedProfiles = state.testedProfiles || {};
+        state.testedProfiles[month] = [...new Set([...(state.testedProfiles[month] || []), agreementId])];
+        await saveJsonToGcs(CUSTOM_PROFILE_STATE_GCS_KEY, state);
+      } catch (e) { console.error("[bill-ling] couldn't record tested profile:", e.message); }
+      await client.chat.postMessage({ token: SLACK_BOT_TOKEN, channel: ch, thread_ts: threadTs, text: `✅ Custom profile set up for *${agreementId}* (${gbp(amount)}). Anchor confirmation: HTTP *${r.httpStatus}* / Status *${r.anchorStatus || "Success"}*. Recorded and excluded from this month's run so it won't be set up again.`, mrkdwn: true, unfurl_links: false, unfurl_media: false });
+    } else {
+      await client.chat.postMessage({ token: SLACK_BOT_TOKEN, channel: ch, thread_ts: threadTs, text: `❌ Custom profile setup FAILED for *${agreementId}*: ${r.detail || r.anchorStatus || "unknown"}${r.httpStatus ? ` (HTTP ${r.httpStatus})` : ""}. Nothing was set up.`, mrkdwn: true, unfurl_links: false, unfurl_media: false });
+    }
+  } catch (err) {
+    console.error("[bill-ling] btn_test_custom_profile error:", err.message);
+    try { await client.chat.postMessage({ token: SLACK_BOT_TOKEN, channel: ch, thread_ts: threadTs, text: `⚠️ Custom-profile test error: ${err.message}`, mrkdwn: true }); } catch (_) {}
   }
 });
 
@@ -21890,6 +21969,20 @@ async function handleMentionEvent(event, say) {
           await say({ text: `Only ${BILLINGTON_REFUND_AUTHORISER_NAMES} can run a batch escalation refund.`, thread_ts: thread_ts || ts });
         } else {
           await postBatchEscRefundPreflight({ channel, threadTs: thread_ts || ts, user, amount: _batchCmd.amount, ids: _batchCmd.ids });
+        }
+        return;
+      }
+    }
+
+    // Custom-profile single-agreement test (Hargo, 23/07/2026): "test custom profile
+    // [on A00…]" from an authoriser → pick one live candidate and post a pre-flight with a
+    // Run button. Nothing hits Anchor until the button is pressed.
+    {
+      if (/\b(?:test|try)\b[\s\S]{0,30}\bcustom\s+profile\b|\bcustom\s+profile\b[\s\S]{0,30}\btest\b/i.test(cleanText || "")) {
+        if (!BILLINGTON_REFUND_AUTHORISERS.has(user)) {
+          await say({ text: `Only ${BILLINGTON_REFUND_AUTHORISER_NAMES} can run a custom-profile test.`, thread_ts: thread_ts || ts });
+        } else {
+          await postCustomProfileTestPreflight({ channel, threadTs: thread_ts || ts, user, requestedId: (cleanText.match(/\bA\d{5,9}\b/i) || [])[0] });
         }
         return;
       }
