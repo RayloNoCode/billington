@@ -23080,49 +23080,57 @@ async function handleMentionEvent(event, say) {
         // Re-run instalment due checks for agreements flagged in this thread
         await say({ text: "Re-checking instalment due transactions via Anchor API...", thread_ts: thread_ts || ts });
         try {
-          // Extract all agreement IDs from the CURRENT message AND the thread
-          // context. cleanText holds the triggering message (e.g. "check
-          // A00020874 …"), which contextMessages deliberately excludes (it's
-          // slice(0,-1)), so scanning context alone missed an ID given inline.
-          const scanText = `${cleanText || ""}\n${contextMessages || ""}`;
-          let ctxAgIds = [...new Set(scanText.match(/\bA\d{5,9}\b/gi) || [])].map(id => id.toUpperCase());
-          // No explicit ID given — don't bail. Pull the highest-arrears agreement
-          // from the flagged population and spot-check it (Hargo, 23/07/2026: when
-          // asked to "check one of those", just query and pick one).
-          let spotChecked = false;
-          if (ctxAgIds.length === 0) {
+          // IDs from THE CURRENT message only — NOT thread context, so Billington's own
+          // earlier spot-check reply can't hijack a "check all" request (Hargo, 23/07/2026:
+          // "check all 21" kept only re-checking the one ID sitting in the thread). Modes:
+          //   • inline IDs → check exactly those,
+          //   • "spot"/"one"/"sample" → single highest-arrears spot-check,
+          //   • otherwise (incl. "all"/"21"/a pasted controls query) → the FULL flagged population.
+          const lower = (cleanText || "").toLowerCase();
+          const inlineIds = [...new Set((cleanText || "").match(/\bA\d{5,9}\b/gi) || [])].map(id => id.toUpperCase());
+          const wantsSpot = /\b(spot|just one|one of|a single|sample|pick one)\b/i.test(lower);
+          const CAP = 60; // bound live Anchor checks per manual recheck
+          let ids = [], checkedFullPopulation = false, prefix = "";
+          if (inlineIds.length) {
+            ids = inlineIds;
+          } else if (wantsSpot) {
             try {
-              const sample = await runBigQueryRaw("SELECT collections_agreements_missing_instalment_due_arrears_estimates_agreement_id AS agreement_id FROM `raylo-production.landing_billington.controls_missing_instalment_check` ORDER BY collections_agreements_missing_instalment_due_arrears_estimates_sum_estimated_arrears DESC LIMIT 1");
-              const sampleId = sample && sample[0] ? String(formatBQValue(sample[0].agreement_id)).toUpperCase() : "";
-              if (/^A\d{5,9}$/.test(sampleId)) { ctxAgIds = [sampleId]; spotChecked = true; }
-            } catch (e) { console.error("[bill-ling] instalment recheck sample query failed:", e.message); }
-          }
-          if (ctxAgIds.length === 0) {
-            reply = "No agreement ID given and I couldn't pull a sample from the flagged population — can't re-check.";
+              const s = await runBigQueryRaw("SELECT collections_agreements_missing_instalment_due_arrears_estimates_agreement_id AS agreement_id FROM `raylo-production.landing_billington.controls_missing_instalment_check` ORDER BY collections_agreements_missing_instalment_due_arrears_estimates_sum_estimated_arrears DESC LIMIT 1");
+              const id = s && s[0] ? String(formatBQValue(s[0].agreement_id)).toUpperCase() : "";
+              if (/^A\d{5,9}$/.test(id)) { ids = [id]; prefix = `Spot-checked the highest-arrears one (${id}):\n`; }
+            } catch (e) { console.error("[bill-ling] recheck spot query failed:", e.message); }
           } else {
-            const recheckLinesPrefix = spotChecked ? `No specific agreement given, so I spot-checked the highest-arrears one (${ctxAgIds[0]}):\n` : "";
-            const recheckLines = [];
-            let anyStillMissing = false;
-            for (const agId of ctxAgIds.slice(0, 10)) {
+            try {
+              const rows = await runBigQueryRaw("SELECT collections_agreements_missing_instalment_due_arrears_estimates_agreement_id AS agreement_id FROM `raylo-production.landing_billington.controls_missing_instalment_check` ORDER BY collections_agreements_missing_instalment_due_arrears_estimates_sum_estimated_arrears DESC");
+              const all = [...new Set((rows || []).map(r => String(formatBQValue(r.agreement_id)).toUpperCase()).filter(x => /^A\d{5,9}$/.test(x)))];
+              if (all.length === 0) { prefix = "The flagged population is currently empty — nothing to re-check.\n"; }
+              else { ids = all.slice(0, CAP); checkedFullPopulation = ids.length === all.length; prefix = checkedFullPopulation ? `Checking all ${all.length} flagged agreement${all.length === 1 ? "" : "s"} from the query:\n` : `Checking the top ${CAP} of ${all.length} flagged (capped — run again for the rest):\n`; }
+            } catch (e) { console.error("[bill-ling] recheck population query failed:", e.message); }
+          }
+          if (ids.length === 0) {
+            reply = prefix || "No agreement ID given and I couldn't pull the flagged population — can't re-check.";
+          } else {
+            const okLines = [], badLines = [];
+            let confirmedCount = 0, stillMissingCount = 0, errorCount = 0;
+            for (const agId of ids) {
               try {
                 const result = await checkMissingInstalments(agId);
-                if (result.missing.length === 0) {
-                  recheckLines.push(`✅ ${agId} — all instalment due transactions confirmed (${result.confirmed.length} checked)`);
-                } else {
-                  anyStillMissing = true;
-                  for (const m of result.missing) {
-                    const actualNote = m.actual !== 0 ? ` (found £${m.actual.toFixed(2)} — mismatch)` : "";
-                    recheckLines.push(`❌ ${agId} — ${m.date} — expected £${m.expected.toFixed(2)}${actualNote}`);
-                  }
-                }
-              } catch (err) {
-                recheckLines.push(`⚠️ ${agId} — API error: ${err.message}`);
-              }
+                if (result.missing.length === 0) { confirmedCount++; okLines.push(`✅ ${agId} — confirmed (${result.confirmed.length} checked)`); }
+                else { stillMissingCount++; for (const m of result.missing) { const an = m.actual !== 0 ? ` (found £${m.actual.toFixed(2)} — mismatch)` : ""; badLines.push(`❌ ${agId} — ${m.date} — expected £${m.expected.toFixed(2)}${an}`); } }
+              } catch (err) { errorCount++; badLines.push(`⚠️ ${agId} — API error: ${err.message}`); }
+              await new Promise(r => setTimeout(r, 250)); // throttle Anchor
             }
-            reply = recheckLinesPrefix + recheckLines.join("\n") + (anyStillMissing ? `\n\n<@${HARGO_USER_ID}> / <@${CIARAN_DOBBIN_USER_ID}> — some instalments still missing.` : "");
+            const anyStillMissing = stillMissingCount > 0 || errorCount > 0;
+            const header = ids.length > 1 ? `*${confirmedCount}/${ids.length} confirmed*${stillMissingCount ? `, ${stillMissingCount} still missing` : ""}${errorCount ? `, ${errorCount} errored` : ""}.` : "";
+            const bodyLines = [...badLines, ...okLines.slice(0, 40)];
+            if (okLines.length > 40) bodyLines.push(`… and ${okLines.length - 40} more confirmed.`);
+            reply = `${prefix}${header ? header + "\n" : ""}${bodyLines.join("\n")}` + (anyStillMissing ? `\n\n<@${HARGO_USER_ID}> / <@${CIARAN_DOBBIN_USER_ID}> — some instalments still missing.` : "");
 
-            // If everything is now confirmed, update the original parent message and add a ✅ reaction
-            if (!anyStillMissing && thread_ts) {
+            // Mark the parent report RESOLVED ONLY when the FULL flagged population was
+            // checked and every one is confirmed — never off a spot-check or a subset
+            // (Hargo, 23/07/2026: a 1-agreement spot-check wrongly flipped a 21-agreement
+            // report to RESOLVED).
+            if (!anyStillMissing && checkedFullPopulation && thread_ts) {
               try {
                 // Use conversations.replies which reliably returns the parent at index 0
                 const parentResp = await app.client.conversations.replies({
