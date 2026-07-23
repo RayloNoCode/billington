@@ -20140,9 +20140,9 @@ async function postBatchEscRefundPreflight({ channel, threadTs, user, amount, id
       { type: "button", text: { type: "plain_text", text: `🧪 Test on first ${testIds.length}`, emoji: true },
         action_id: "btn_batch_escrefund_test", value: JSON.stringify({ amount, ids: testIds }),
         confirm: { title: { type: "plain_text", text: "Test refund?" }, text: { type: "mrkdwn", text: `Posts GOGW ${gbpFmt(amount)} + refund ${gbpFmt(amount)} on the first ${testIds.length} agreements. Real money.` }, confirm: { type: "plain_text", text: "Test it" }, deny: { type: "plain_text", text: "Cancel" } } },
-      { type: "button", text: { type: "plain_text", text: `▶️ Process remaining (batches of 10)`, emoji: true }, style: "primary",
+      { type: "button", text: { type: "plain_text", text: `▶️ Process (10 at a time)`, emoji: true }, style: "primary",
         action_id: "btn_batch_escrefund_run", value: JSON.stringify({ amount, ids }),
-        confirm: { title: { type: "plain_text", text: "Process all?" }, text: { type: "mrkdwn", text: `Processes all ${ids.length} in batches of 10. Already-refunded agreements are skipped. Real money — up to ${gbpFmt(total)}.` }, confirm: { type: "plain_text", text: "Process" }, deny: { type: "plain_text", text: "Cancel" } } },
+        confirm: { title: { type: "plain_text", text: "Process next 10?" }, text: { type: "mrkdwn", text: `Processes the first 10, then shows a button for the next 10, and so on. Already-refunded are skipped, in-arrears are held. Real money.` }, confirm: { type: "plain_text", text: "Process 10" }, deny: { type: "plain_text", text: "Cancel" } } },
     ]},
   ];
   await app.client.chat.postMessage({ token: SLACK_BOT_TOKEN, channel, thread_ts: threadTs, text: "Batch escalation refund pre-flight", blocks, mrkdwn: true, unfurl_links: false, unfurl_media: false });
@@ -20225,7 +20225,7 @@ app.action("btn_batch_escrefund_test", async ({ body, ack, client }) => {
     if (!ids.length || !(amount > 0)) { await client.chat.postEphemeral({ token: SLACK_BOT_TOKEN, channel: ch, user, text: `Couldn't read the test batch.` }); return; }
     await client.chat.postMessage({ token: SLACK_BOT_TOKEN, channel: ch, thread_ts: threadTs, text: `🧪 Testing on ${ids.length} agreement${ids.length === 1 ? "" : "s"} (${ids.join(", ")})…`, mrkdwn: true });
     const res = await runBatchEscalationRefunds({ client, channel: ch, threadTs, user, ids, amount, chunkSize: ids.length });
-    await client.chat.postMessage({ token: SLACK_BOT_TOKEN, channel: ch, thread_ts: threadTs, text: summariseBatchEscRefund(res, `Test on ${ids.length}`, user, amount) + `\n\nIf that looks right, press *▶️ Process remaining (batches of 10)* above.`, mrkdwn: true, unfurl_links: false, unfurl_media: false });
+    await client.chat.postMessage({ token: SLACK_BOT_TOKEN, channel: ch, thread_ts: threadTs, text: summariseBatchEscRefund(res, `Test on ${ids.length}`, user, amount) + `\n\nIf that looks right, press *▶️ Process (10 at a time)* above.`, mrkdwn: true, unfurl_links: false, unfurl_media: false });
   } catch (err) {
     console.error("[bill-ling] btn_batch_escrefund_test error:", err.message);
     try { await client.chat.postMessage({ token: SLACK_BOT_TOKEN, channel: ch, thread_ts: threadTs, text: `⚠️ Test hit an error: ${err.message}. Check the logs before processing the rest.`, mrkdwn: true }); } catch (_) {}
@@ -20242,17 +20242,36 @@ app.action("btn_batch_escrefund_run", async ({ body, ack, client }) => {
       return;
     }
     let payload; try { payload = JSON.parse(body.actions?.[0]?.value || "{}"); } catch (_) { payload = {}; }
-    const ids = Array.isArray(payload.ids) ? payload.ids : [];
+    const allIds = Array.isArray(payload.ids) ? payload.ids : [];
     const amount = Number(payload.amount);
-    if (!ids.length || !(amount > 0)) { await client.chat.postEphemeral({ token: SLACK_BOT_TOKEN, channel: ch, user, text: `Couldn't read the batch.` }); return; }
-    // Disable both buttons immediately so a double-press can't kick off a second run.
+    if (!allIds.length || !(amount > 0)) { await client.chat.postEphemeral({ token: SLACK_BOT_TOKEN, channel: ch, user, text: `Couldn't read the batch.` }); return; }
+    // Process ONE batch of 10, then stop and re-post a button for the rest (Hargo,
+    // 23/07/2026) so each 10 can be eyeballed before continuing.
+    const BATCH = 10;
+    const thisBatch = allIds.slice(0, BATCH);
+    const remaining = allIds.slice(BATCH);
+    // Disable the pressed button immediately so it can't double-fire this batch.
     try {
       const kept = (body.message?.blocks || []).filter(b => b.type !== "actions");
-      kept.push({ type: "context", elements: [{ type: "mrkdwn", text: `▶️ Processing ${ids.length} in batches of 10 (started by <@${user}>)…` }] });
+      kept.push({ type: "context", elements: [{ type: "mrkdwn", text: `▶️ Processing ${thisBatch.length} (started by <@${user}>)…` }] });
       await client.chat.update({ token: SLACK_BOT_TOKEN, channel: ch, ts, text: body.message?.text || "Processing batch escalation refunds.", blocks: kept });
     } catch (_) {}
-    const res = await runBatchEscalationRefunds({ client, channel: ch, threadTs, user, ids, amount, chunkSize: 10 });
-    await client.chat.postMessage({ token: SLACK_BOT_TOKEN, channel: ch, thread_ts: threadTs, text: summariseBatchEscRefund(res, `Batch escalation refund (${ids.length} in 10s)`, user, amount), mrkdwn: true, unfurl_links: false, unfurl_media: false });
+    const res = await runBatchEscalationRefunds({ client, channel: ch, threadTs, user, ids: thisBatch, amount, chunkSize: thisBatch.length });
+    const summary = summariseBatchEscRefund(res, `Batch of ${thisBatch.length}`, user, amount);
+    if (remaining.length) {
+      const nextN = Math.min(BATCH, remaining.length);
+      const blocks = [
+        { type: "section", text: { type: "mrkdwn", text: `${summary}\n\n*${remaining.length} still to process.* Press below when ready for the next ${nextN}.` } },
+        { type: "actions", elements: [
+          { type: "button", text: { type: "plain_text", text: `▶️ Process next ${nextN} (${remaining.length} left)`, emoji: true }, style: "primary",
+            action_id: "btn_batch_escrefund_run", value: JSON.stringify({ amount, ids: remaining }),
+            confirm: { title: { type: "plain_text", text: "Process next batch?" }, text: { type: "mrkdwn", text: `Processes the next ${nextN} of ${remaining.length} remaining. Already-refunded are skipped, in-arrears are held. Real money.` }, confirm: { type: "plain_text", text: "Process" }, deny: { type: "plain_text", text: "Cancel" } } },
+        ]},
+      ];
+      await client.chat.postMessage({ token: SLACK_BOT_TOKEN, channel: ch, thread_ts: threadTs, text: summary, blocks, mrkdwn: true, unfurl_links: false, unfurl_media: false });
+    } else {
+      await client.chat.postMessage({ token: SLACK_BOT_TOKEN, channel: ch, thread_ts: threadTs, text: `${summary}\n\n✅ That was the last batch — all agreements processed.`, mrkdwn: true, unfurl_links: false, unfurl_media: false });
+    }
   } catch (err) {
     console.error("[bill-ling] btn_batch_escrefund_run error:", err.message);
     try { await client.chat.postMessage({ token: SLACK_BOT_TOKEN, channel: ch, thread_ts: threadTs, text: `⚠️ Batch run hit an error: ${err.message}. Some may not have processed — check the summary/logs.`, mrkdwn: true }); } catch (_) {}
