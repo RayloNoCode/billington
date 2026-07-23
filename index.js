@@ -19951,7 +19951,14 @@ ${ANCHOR_CREDENTIALS_XML}
   const resultM = xml.match(/<Result>\s*(true|false)\s*<\/Result>/i);
   const st = statusM ? statusM[1].trim() : null;
   const rs = resultM ? resultM[1].toLowerCase() : null;
-  if ((st && !/^success$/i.test(st)) || rs === "false") {
+  // Success detection (Hargo, 23/07/2026): a clean HTTP 200 with <Status>Success</Status>
+  // IS a success — even though the SetupCustomProfile response also carries a nested
+  // <Result>false</Result>, that Result is NOT the operation outcome (A00087306 was set up
+  // in Anchor despite Result=false). So trust <Status> when present; only fall back to
+  // <Result> when there's no <Status> at all. The old code failed on Result=false and
+  // wrongly reported every successful setup as FAILED.
+  const isSuccess = st != null ? /^success$/i.test(st) : (rs !== "false");
+  if (!isSuccess) {
     const msgs = [...xml.matchAll(/<a:string>\s*([^<]+?)\s*<\/a:string>/gi)].map(m => m[1].replace(/\s+/g, " ").trim()).filter(Boolean);
     return { ok: false, httpStatus: status, anchorStatus: st || "Failure", detail: msgs.length ? msgs.join(" | ") : (st || "failure") };
   }
