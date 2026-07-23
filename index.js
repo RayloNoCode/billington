@@ -147,9 +147,10 @@ const OPS_STRATEGY_ESCALATION_NAMED    = OPS_STRATEGY_ESCALATION.map(p => `<@${p
 
 // Refund responsibility matrix — who to chase for each scenario
 const REFUND_CONTACTS = {
-  BATCH_FILE_UNCONFIRMED: { name: "Aoibheann McCann", id: "U03KLSGUCE8" },  // file not confirmed uploaded to Barclays
+  BATCH_FILE_OWNER:       { name: "Caitlyn Watson",   id: "U0BFD2CE7DG" },  // Hargo 22/07/2026: primary owner of the Barclays refund file — chased first (day 1)
+  BATCH_FILE_UNCONFIRMED: { name: "Aoibheann McCann", id: "U03KLSGUCE8" },  // day-2 escalation (file not confirmed uploaded to Barclays)
   FINANCE_ESCALATION:     { name: "Darragh Keogh",    id: "U06Q852MJKH" },  // finance escalation
-  FINANCE_ESCALATION_2:   { name: "Peter Lundy",      id: "U026W3V5QUE" },  // finance escalation day 3
+  FINANCE_ESCALATION_2:   { name: "Peter Lundy",      id: "U026W3V5QUE" },  // finance escalation (last resort)
   PROCESSING:             { name: "Charlotte Platt",  id: "U09N2EEBTHA" },  // Hargo, 29/05/2026: switched from Thomas Crudden to Charlotte Platt for trade-in / approved-refund processing
   PROCESSING_ESCALATION:  { name: "Hargo",            id: "U01DMHVF8KG" },  // escalation for refund processing
 };
@@ -165,6 +166,23 @@ const BILLINGTON_REFUND_AUTHORISERS = new Set([
   CIARAN_DOBBIN_USER_ID,   // Ciaran Dobbin
 ]);
 const BILLINGTON_REFUND_AUTHORISER_NAMES = "Hargo, Charlotte Platt or Ciaran Dobbin";
+
+// Escalation-refund approver policy (Hargo, 23/07/2026) — RECORDED FOR REFERENCE,
+// deliberately NOT enforced in code. Escalation refunds already self-approve from
+// keywords via the approval monitor (see isSelfApproved), and Hargo asked to "keep
+// approvals as they are". Jess Higham, Ronan Gildea and Ciaran Dobbin may approve
+// ESCALATION refunds up to £500. Their names are NOT proactively @mentioned or
+// chased — only relevant if they themselves request or approve in a thread.
+// Processing still routes through the normal PROCESSING group (Charlotte).
+const ESCALATION_REFUND_APPROVERS = {
+  limitGbp: 500,
+  approvers: [
+    { name: "Jess Higham",   id: "U0A6PBWMSLD" }, // jessica.higham@raylo.com
+    { name: "Ronan Gildea",  id: "U09D1UMM8GY" }, // ronan.gildea@raylo.com
+    { name: "Ciaran Dobbin", id: "U0B06LCLWNQ" },
+  ],
+};
+void ESCALATION_REFUND_APPROVERS; // reference-only; suppress unused-var noise
 
 // Interactive Block Kit buttons on Billington's option messages (Hargo,
 // 18/06/2026). A click runs the SAME deterministic handler as typing the
@@ -196,11 +214,8 @@ const GOGW_TYPE_TAG_TO_CATEGORY = {
 
 // Fallback chains — if the primary person is OOO/annual leave, chase the next in line
 const REFUND_CHASE_CHAINS = {
-  BATCH_FILE: [
-    REFUND_CONTACTS.BATCH_FILE_UNCONFIRMED,  // Day 1: Aoibheann
-    REFUND_CONTACTS.FINANCE_ESCALATION,       // Day 2: Darragh
-    REFUND_CONTACTS.FINANCE_ESCALATION_2,     // Day 3: Peter
-  ],
+  // BATCH_FILE (Barclays) is date-aware — see getBatchFileChaseChain() below
+  // (Caitlyn day 1; Aoibheann day 2 until 22/08/2026 then dropped; Darragh; Peter).
   // Once a refund has been APPROVED via GOGW, it's Charlotte (billing) who
   // actions it — finance is NOT in this chain. If Charlotte hasn't actioned
   // within 2 working days, escalate straight to Hargo. Day-based, not
@@ -224,6 +239,21 @@ const REFUND_CHASE_CHAINS = {
     REFUND_CONTACTS.PROCESSING_ESCALATION,    // Hargo
   ],
 };
+
+// Batch-file (Barclays) chase ladder, date-aware. Caitlyn Watson is the day-1
+// owner (Hargo, 22/07/2026). Aoibheann McCann sits at day 2 as a transitional
+// escalation UNTIL 22/08/2026, from which date she is dropped from the rota
+// entirely (Hargo, 22/07/2026) — from then the ladder is Caitlyn → Darragh →
+// Peter. Evaluated per-chase off the London date so it flips automatically.
+const AOIBHEANN_DROP_DATE = "2026-08-22"; // on/after this (London), Aoibheann is off the batch-file chase
+function getBatchFileChaseChain() {
+  const today = new Date().toLocaleDateString("en-CA", { timeZone: "Europe/London" }); // YYYY-MM-DD, lexicographically comparable
+  const base = [REFUND_CONTACTS.BATCH_FILE_OWNER]; // Day 1: Caitlyn
+  if (today < AOIBHEANN_DROP_DATE) base.push(REFUND_CONTACTS.BATCH_FILE_UNCONFIRMED); // Day 2: Aoibheann (until 22/08/2026)
+  base.push(REFUND_CONTACTS.FINANCE_ESCALATION);   // then Darragh
+  base.push(REFUND_CONTACTS.FINANCE_ESCALATION_2); // then Peter (last resort)
+  return base;
+}
 
 // Refunds at or below this amount are within a lead's approval authority, so
 // they're chased to the lead (Laura) rather than the senior approvers. Above
@@ -539,7 +569,7 @@ You have the following cron jobs that run automatically:
 - 08:15 daily: GoCardless Trade In account balance check to #data-billing-updates (fetches the live balance, then computes EXACTLY when it runs out by drawing it down against the scheduled future trade-in payments). Warns and @-mentions Peter Lundy when a top up is required: balance under £1,000, or 2 working days before the scheduled runout date. Replaced Make scenario 6556790. Ask "what's the GoCardless balance?" any time to run it on demand.
 - 09:00 Mon-Fri: BACS batch forecast to #data-billing-updates
 - 09:00-17:00 hourly Mon-Fri: Refund approval monitor (checks for approvals in #customer-refunds-and-complaints, verifies refund posted via Anchor API, confirms or chases)
-- 12:00 Mon-Fri: Missing instalment due control check (queries BigQuery for missing instalment due transactions, verifies each via Anchor API, reports confirmed/missing to #data-billing-updates). Users can ask "which agreements are missing?" or "show flagged agreements" for drill-down details.
+- 15:30 Mon-Fri: Missing instalment due control check (queries BigQuery for missing instalment due transactions, verifies each via Anchor API, reports confirmed/missing to #data-billing-updates). Users can ask "which agreements are missing?" or "show flagged agreements" for drill-down details.
 - 12:00 Mon-Fri: Bank holiday profile check (queries landing_billington.bank_holiday_profile_check for agreements with instalments due on UK bank holidays; if ≤10 results, verifies each via Anchor API and reports which are corrected vs still flagged; if >10, posts the full query).
 - 15:00 Mon-Fri: BACS batch file summary to #data-billing-updates
 - 15:00 Mon-Fri: Notices QA report (LPF/NODS + NOSIA/SNOSIA email QA) to #data-billing-updates
@@ -5202,7 +5232,7 @@ function buildTasksList() {
 \u2022 *08:10* — Stannp balance check (with 30-day spend tracking) \u2192 #data-billing-updates + #collab-finance-customer-ops
 \u2022 *09:00* — BACS batch forecast for the next due date \u2192 #data-billing-updates
 \u2022 *09:00-17:00 (hourly)* — Refund approval monitor \u2014 checks #customer-refunds-and-complaints for approvals, verifies refund posted in Anchor API, confirms or chases
-\u2022 *12:00* — Missing instalment due control check \u2014 queries BigQuery, verifies via Anchor API, reports to #data-billing-updates (ask me "which agreements are missing?" for drill-down)
+\u2022 *15:30* — Missing instalment due control check \u2014 queries BigQuery, verifies via Anchor API, reports to #data-billing-updates (ask me "which agreements are missing?" for drill-down)
 \u2022 *12:00* — Bank holiday profile check \u2014 flags agreements with instalments due on UK bank holidays; checks Anchor API if ≤10 results, reports corrected vs still flagged \u2192 #data-billing-updates
 \u2022 *15:00* — BACS batch file summary (all files generated today) \u2192 #data-billing-updates
 \u2022 *15:00* — Notices QA report (LPF/NODS + NOSIA/SNOSIA email QA) \u2192 #data-billing-updates
@@ -9563,14 +9593,14 @@ async function postRefundChasers(data) {
     try {
       let chaseMsg = item.chase_message;
       let processingLock = null; // set when an awaiting_processing chase locks a figure (drives the Post button)
-      const chain = item._bucket === "batch_files" ? REFUND_CHASE_CHAINS.BATCH_FILE
+      const chain = item._bucket === "batch_files" ? getBatchFileChaseChain()
         : item._bucket === "awaiting_processing" ? REFUND_CHASE_CHAINS.PROCESSING
         : item._bucket === "awaiting_approval" ? REFUND_CHASE_CHAINS.APPROVAL
         : null;
       if (chain) {
         let target;
         if (item._bucket === "batch_files") {
-          // Day-based escalation for batch files: day 1 → Aoibheann, day 2 → Darragh, day 3+ → Peter
+          // Day-based escalation for batch files: day 1 → Caitlyn, day 2 → Aoibheann, day 3 → Darragh, day 4+ → Peter
           const chainIdx = Math.min(days - 1, chain.length - 1);
           target = chain[chainIdx];
           console.log(`[bill-ling] Batch file chase day ${days}: ${target.name} for ${item.ref || item.date}`);
@@ -10573,11 +10603,11 @@ ${transcript}
 RESPONSIBILITY (inferred from last 30 days of channel activity — primary contact first, escalation second):
 • Approvals: ${fmtContact(contacts.approval, REFUND_CONTACTS.PROCESSING_ESCALATION.id, "Hargo")}
 • Processing refunds: ${fmtContact(contacts.processing, REFUND_CONTACTS.PROCESSING.id, "Charlotte Platt")}
-• Batch file / Barclays upload: ${fmtContact(contacts.batch_file, REFUND_CONTACTS.BATCH_FILE_UNCONFIRMED.id, "Aoibheann McCann")}
-• Barclays confirmation: ${fmtContact(contacts.barclays_confirmation, REFUND_CONTACTS.BATCH_FILE_UNCONFIRMED.id, "Aoibheann McCann")}
+• Batch file / Barclays upload: ${fmtContact(contacts.batch_file, REFUND_CONTACTS.BATCH_FILE_OWNER.id, "Caitlyn Watson")}
+• Barclays confirmation: ${fmtContact(contacts.barclays_confirmation, REFUND_CONTACTS.BATCH_FILE_OWNER.id, "Caitlyn Watson")}
 ` : `
 RESPONSIBILITY (fallback — could not infer from history):
-• Batch file not confirmed uploaded to Barclays → <@${REFUND_CONTACTS.BATCH_FILE_UNCONFIRMED.id}> (Aoibheann McCann)
+• Barclays refund file (upload + confirmation) → <@${REFUND_CONTACTS.BATCH_FILE_OWNER.id}> (Caitlyn Watson)
 • Finance escalation → <@${REFUND_CONTACTS.FINANCE_ESCALATION.id}> (Darragh Keogh)
 • Processing individual refund requests → <@${REFUND_CONTACTS.PROCESSING.id}> (Charlotte Platt)
 • Refund processing escalation → <@${REFUND_CONTACTS.PROCESSING_ESCALATION.id}> (Hargo)
@@ -10652,7 +10682,7 @@ Return ONLY valid JSON in this exact structure (no other text):
       "payments": 0,
       "amount": 0.00,
       "permalink": "https://...",
-      "chase_message": "<@${REFUND_CONTACTS.BATCH_FILE_UNCONFIRMED.id}> can you confirm if this refund file has been uploaded and processed on Barclays?"
+      "chase_message": "<@${REFUND_CONTACTS.BATCH_FILE_OWNER.id}> can you confirm if this refund file has been uploaded and processed on Barclays?"
     }
   ],
   "resolved": [
@@ -18979,13 +19009,13 @@ async function sendDM(userId, text) {
 // );
 console.log("[bill-ling] Payment Profile Issues daily cron is DISABLED — ad-hoc only until Hargo signs it off.");
 
-// Cron: 12:00 Mon-Fri — Missing instalment due control check
+// Cron: 15:30 Mon-Fri — Missing instalment due control check (moved from 12:00, Hargo 23/07/2026)
 cron.schedule(
-  "0 12 * * 1-5",
+  "30 15 * * 1-5",
   () => { runMissingInstalmentCheck(); },
   { timezone: "Europe/London" }
 );
-console.log("[bill-ling] Missing instalment check scheduled for 12:00 Mon-Fri (Europe/London).");
+console.log("[bill-ling] Missing instalment check scheduled for 15:30 Mon-Fri (Europe/London).");
 
 // Cron: 12:00 Mon-Fri — Bank holiday profile check
 cron.schedule(
@@ -21012,7 +21042,8 @@ function buildHomeBlocks() {
           "• *08:40 Mon–Fri* — Late fee readiness check (rechecks every 30 min until 15:00) → #data-billing-updates\n" +
           "• *09:00 Mon–Fri* — BACS batch forecast → #data-billing-updates\n" +
           "• *09:00 Tue–Fri / 10:30 Mon* — ARUDD bounce report → #data-billing-updates\n" +
-          "• *12:00 Mon–Fri* — Missing instalment due control + bank holiday profile check → #data-billing-updates\n" +
+          "• *15:30 Mon–Fri* — Missing instalment due control check → #data-billing-updates\n" +
+          "• *12:00 Mon–Fri* — Bank holiday profile check → #data-billing-updates\n" +
           "• *15:00 Mon–Fri* — BACS batch file summary → #data-billing-updates\n" +
           "• *15:00 Mon–Fri* — Notices QA report (LPF/NODS + NOSIA/SNOSIA) → #data-billing-updates\n" +
           "• *Hourly 09:00–17:00 Mon–Fri* — Refund approval monitor (chases approvals + processing past SLA, auto-confirms via Anchor)\n" +
@@ -22749,11 +22780,27 @@ async function handleMentionEvent(event, say) {
         // Re-run instalment due checks for agreements flagged in this thread
         await say({ text: "Re-checking instalment due transactions via Anchor API...", thread_ts: thread_ts || ts });
         try {
-          // Extract all agreement IDs from thread context
-          const ctxAgIds = [...new Set((contextMessages || "").match(/\bA\d{5,9}\b/gi) || [])].map(id => id.toUpperCase());
+          // Extract all agreement IDs from the CURRENT message AND the thread
+          // context. cleanText holds the triggering message (e.g. "check
+          // A00020874 …"), which contextMessages deliberately excludes (it's
+          // slice(0,-1)), so scanning context alone missed an ID given inline.
+          const scanText = `${cleanText || ""}\n${contextMessages || ""}`;
+          let ctxAgIds = [...new Set(scanText.match(/\bA\d{5,9}\b/gi) || [])].map(id => id.toUpperCase());
+          // No explicit ID given — don't bail. Pull the highest-arrears agreement
+          // from the flagged population and spot-check it (Hargo, 23/07/2026: when
+          // asked to "check one of those", just query and pick one).
+          let spotChecked = false;
           if (ctxAgIds.length === 0) {
-            reply = "No agreement IDs found in this thread — can't re-check.";
+            try {
+              const sample = await runBigQueryRaw("SELECT collections_agreements_missing_instalment_due_arrears_estimates_agreement_id AS agreement_id FROM `raylo-production.landing_billington.controls_missing_instalment_check` ORDER BY collections_agreements_missing_instalment_due_arrears_estimates_sum_estimated_arrears DESC LIMIT 1");
+              const sampleId = sample && sample[0] ? String(formatBQValue(sample[0].agreement_id)).toUpperCase() : "";
+              if (/^A\d{5,9}$/.test(sampleId)) { ctxAgIds = [sampleId]; spotChecked = true; }
+            } catch (e) { console.error("[bill-ling] instalment recheck sample query failed:", e.message); }
+          }
+          if (ctxAgIds.length === 0) {
+            reply = "No agreement ID given and I couldn't pull a sample from the flagged population — can't re-check.";
           } else {
+            const recheckLinesPrefix = spotChecked ? `No specific agreement given, so I spot-checked the highest-arrears one (${ctxAgIds[0]}):\n` : "";
             const recheckLines = [];
             let anyStillMissing = false;
             for (const agId of ctxAgIds.slice(0, 10)) {
@@ -22772,7 +22819,7 @@ async function handleMentionEvent(event, say) {
                 recheckLines.push(`⚠️ ${agId} — API error: ${err.message}`);
               }
             }
-            reply = recheckLines.join("\n") + (anyStillMissing ? `\n\n<@${HARGO_USER_ID}> / <@${CIARAN_DOBBIN_USER_ID}> — some instalments still missing.` : "");
+            reply = recheckLinesPrefix + recheckLines.join("\n") + (anyStillMissing ? `\n\n<@${HARGO_USER_ID}> / <@${CIARAN_DOBBIN_USER_ID}> — some instalments still missing.` : "");
 
             // If everything is now confirmed, update the original parent message and add a ✅ reaction
             if (!anyStillMissing && thread_ts) {
