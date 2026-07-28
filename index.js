@@ -579,7 +579,7 @@ You have the following cron jobs that run automatically:
 - 15:30 Mon-Fri: Missing instalment due control check (flags agreements missing instalment-due transactions, verifies via Anchor; ask "which agreements are missing?" to drill down, or "check all" to re-verify the whole flagged population)
 - 16:00 Mon-Fri: Apply Final Hire Payment campaign
 - 17:00 Mon-Fri: Repair/warranty activation charges campaign (bottom-line pre-flight + Run button)
-- 15:00 on the 4th working day before month-end: Monthly custom re-collection profiles ("custom profiling"). Queries arrears agreements eligible for a supplement Direct Debit re-collection (Direct Debit method; total_arrears ≥ £10; last successful DD on/after last payment date; no returned DD within the last 30 days; ≤ 2 missed payments; not on hold / frozen / DCA / write-off / debt-sale). Amount = ONE month's recurring instalment when arrears > £85, otherwise the full arrears. Posts a bottom-line pre-flight (count + total) with a Run button to #data-billing-updates — NOTHING hits Anchor until an authoriser (Hargo / Charlotte / Ciaran) clicks Run, which posts one Anchor SetupCustomProfile per agreement (one working-day payment, removed when complete). Idempotent per month; holds for review if the population is > 2× last month; agreements set up via "test custom profile" are excluded. Ask "test custom profile [on A00…]" to trial one agreement first.
+- 15:00 on the 4th working day before month-end: Monthly custom re-collection profiles ("custom profiling"). Queries arrears agreements eligible for a supplement Direct Debit re-collection (Direct Debit method; total_arrears ≥ £10; last successful DD on/after last payment date; no returned DD within the last 30 days; ≤ 2 missed payments; not on hold / frozen / DCA / write-off / debt-sale). Amount = ONE month's recurring instalment when arrears > £85, otherwise the full arrears. Posts a bottom-line pre-flight (count + total) with a Run button to #data-billing-updates — NOTHING hits Anchor until an authoriser (Hargo / Charlotte / Ciaran) clicks Run, which posts one Anchor SetupCustomProfile per agreement (one working-day payment, removed when complete). Idempotent per month; holds for review if the population is > 2× last month; any agreement already set up this month is excluded (no double-collection). If asked, I can show the EXACT BigQuery candidate query and the per-agreement SetupCustomProfile SOAP request (SOAP with credentials redacted).
 - Mon 09:00: Weekly review — DMs Hargo the week's "Billington is incorrect" flags for review
 - Every minute: check and fire pending reminders
 You ALWAYS know about these. If someone asks about your schedule or "what scheduled tasks do you run", give the outline of this whole list. If someone asks HOW a specific one works (e.g. "how does custom profiling work?"), give the FULL detail from its entry above — when it runs, what it queries/checks, what it posts, and any human approval gate — not just the one-liner. Never say you don't have it in your knowledge base.
@@ -19894,8 +19894,7 @@ function workingDaysLeftInMonthAfter(todayStr) {
 
 // Fetch arrears agreements eligible for a custom re-collection profile. Base-table
 // swaps keep it readable by Billington's SA; the rest is Hargo's query verbatim.
-async function queryCustomProfileCandidates() {
-  const rows = await runBigQueryRaw(`
+const CUSTOM_PROFILE_CANDIDATE_SQL = `
     WITH
       last_bounce AS ( SELECT * FROM ( SELECT transactions.*, ROW_NUMBER() OVER (PARTITION BY agreement_id ORDER BY transaction_created_at DESC) trans_rank FROM ( SELECT transaction_date, created_at as transaction_created_at, transaction_id, agreement_id, transaction_type_id, total_amount FROM \`raylo-production.dbt_production.intermediate_core_transactions\` AS transactions WHERE transaction_type_id = 150 ) AS transactions ) WHERE trans_rank = 1),
       last_dd AS ( SELECT * FROM ( SELECT transactions.*, ROW_NUMBER() OVER (PARTITION BY agreement_id ORDER BY transaction_created_at DESC) trans_rank FROM ( SELECT transaction_date, created_at as transaction_created_at, transaction_id, agreement_id, transaction_type_id, total_amount FROM \`raylo-production.dbt_production.intermediate_core_transactions\` AS transactions WHERE transaction_type_id = 12 and reversal_id is null) AS transactions ) WHERE trans_rank = 1),
@@ -19929,7 +19928,9 @@ async function queryCustomProfileCandidates() {
       cast(current_date() as datetime) as date
      from custom_profiling where total_arrears >= 10
      order by total_arrears desc
-  `);
+`;
+async function queryCustomProfileCandidates() {
+  const rows = await runBigQueryRaw(CUSTOM_PROFILE_CANDIDATE_SQL);
   return (rows || []).map(r => ({
     agreementId: formatBQValue(r.agreement_id),
     amount: Number(formatBQValue(r.custom_profiling_amount)) || 0,
@@ -19941,6 +19942,41 @@ async function queryCustomProfileCandidates() {
 // envelope from Hargo's template (credentials + per-row agreement/amount/startDate,
 // all other fields fixed), POST, and treat ONLY a clean 200 with Status=Success /
 // Result=true as success. Returns { ok, detail? }.
+// The SetupCustomProfile SOAP request, credentials redacted + example values, for
+// showing on demand ("show me the custom profiling soap request"). Mirrors the real
+// envelope built in anchorSetupCustomProfile below (Hargo, 24/07/2026).
+function buildCustomProfileSoapExample() {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:anc="urn:anchor.co.uk/2017/05/AnchorCollections">
+   <soapenv:Body>
+      <anc:SetupCustomProfile>
+         <anc:request>
+            <anc:Credentials><!-- redacted --></anc:Credentials>
+            <anc:AgreementNumber>A00XXXXXX</anc:AgreementNumber>
+            <anc:Profile>
+               <anc:Amount>53.83</anc:Amount>
+               <anc:SupplementProfile>1</anc:SupplementProfile>
+               <anc:FrequencyType>WorkingDay</anc:FrequencyType>
+               <anc:StartDate>2026-07-22T00:00:00</anc:StartDate>
+               <anc:RangeType>Payments</anc:RangeType>
+               <anc:DaysInterval>0</anc:DaysInterval>
+               <anc:MonthsInterval>0</anc:MonthsInterval>
+               <anc:DayOfMonth>0</anc:DayOfMonth>
+               <anc:Payments>1</anc:Payments>
+               <anc:EndArrears>0</anc:EndArrears>
+               <anc:OnGoing>0</anc:OnGoing>
+               <anc:PaymentsMade>0</anc:PaymentsMade>
+               <anc:RemoveWhenComplete>1</anc:RemoveWhenComplete>
+               <anc:WorkingDay>23</anc:WorkingDay>
+               <anc:WeekdayNumber>5</anc:WeekdayNumber>
+               <anc:Weekday>5</anc:Weekday>
+            </anc:Profile>
+         </anc:request>
+      </anc:SetupCustomProfile>
+   </soapenv:Body>
+</soapenv:Envelope>`;
+}
+
 async function anchorSetupCustomProfile(agreementId, amount, startDate) {
   const soapBody = `<?xml version="1.0" encoding="UTF-8"?>
 <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/" xmlns:anc="urn:anchor.co.uk/2017/05/AnchorCollections">
@@ -22013,6 +22049,21 @@ async function handleMentionEvent(event, say) {
         } else {
           await postBatchEscRefundPreflight({ channel, threadTs: thread_ts || ts, user, amount: _batchCmd.amount, ids: _batchCmd.ids });
         }
+        return;
+      }
+    }
+
+    // Show the custom-profiling BigQuery query / SOAP request on demand (Hargo, 24/07/2026).
+    // Returns the EXACT strings from the code (SOAP with credentials redacted) — no LLM
+    // paraphrasing of SQL/XML.
+    {
+      const cpAsk = /\bcustom\s*profil/i.test(cleanText || "");
+      if (cpAsk && /\b(quer(?:y|ies)|sql|bigquery|bq)\b/i.test(cleanText || "")) {
+        await say({ text: `The BigQuery query custom profiling runs to find eligible agreements:\n\`\`\`\n${CUSTOM_PROFILE_CANDIDATE_SQL.trim()}\n\`\`\``, thread_ts: thread_ts || ts, unfurl_links: false, unfurl_media: false });
+        return;
+      }
+      if (cpAsk && /\b(soap|envelope|xml|payload)\b/i.test(cleanText || "")) {
+        await say({ text: `The SetupCustomProfile SOAP request sent per agreement when Run is pressed (credentials redacted):\n\`\`\`xml\n${buildCustomProfileSoapExample()}\n\`\`\``, thread_ts: thread_ts || ts, unfurl_links: false, unfurl_media: false });
         return;
       }
     }
