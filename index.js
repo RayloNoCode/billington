@@ -565,18 +565,24 @@ const BILL_LING_SYSTEM_PROMPT = `# Bill Ling – AI Direct Report for Hargo (Ray
 You have the following cron jobs that run automatically:
 - 08:00 Mon-Fri: Refund summary + thread chasers to #customer-refunds-and-complaints
 - 08:05 Mon-Fri: Make.com operations usage check to #data-billing-updates (flags if projected to exceed 90% of monthly limit)
-- 08:10 Mon-Fri: Stannp balance check to #data-billing-updates and #collab-finance-customer-ops (tracks daily balance, calculates 30-day spend, warns if balance running low or projected to run out within 30 days)
-- 08:15 daily: GoCardless Trade In account balance check to #data-billing-updates (fetches the live balance, then computes EXACTLY when it runs out by drawing it down against the scheduled future trade-in payments). Warns and @-mentions Peter Lundy when a top up is required: balance under £1,000, or 2 working days before the scheduled runout date. Replaced Make scenario 6556790. Ask "what's the GoCardless balance?" any time to run it on demand.
+- 08:10 daily: Combined finance balance check (Stannp + GoCardless) to #collab-finance-customer-ops ONLY. SILENT when both accounts are healthy — it only posts an account that needs a top up. Urgency is tiered by WORKING DAYS to runout (👁️ soon / ⚠️ warning / 🚨 alert); ⚠️/🚨 posts add a "Confirm account topped up" button and @-mention Peter Lundy. Stannp runout = 60-day burn-rate projection; GoCardless runout = exact draw-down of the live balance against scheduled future trade-in payments. Ask "what's the GoCardless / Stannp balance?" to run either on demand.
+- 08:40 Mon-Fri: Late fee readiness check — verifies ARUDD >= 99% reconciled + source tables fresh, counts pending late fees, and AUTO-FIRES the Apply Late Fees Make scenario when every criterion is green (standing consent); otherwise rechecks every 30 min until 15:00. Soft close-band: if the only lag is GoCardless reconciliation while Anchor bounces look healthy, it posts a manual "Run Apply Late Fees" button instead of auto-firing.
 - 09:00 Mon-Fri: BACS batch forecast to #data-billing-updates
-- 09:00-17:00 hourly Mon-Fri: Refund approval monitor (checks for approvals in #customer-refunds-and-complaints, verifies refund posted via Anchor API, confirms or chases)
-- 15:30 Mon-Fri: Missing instalment due control check (queries BigQuery for missing instalment due transactions, verifies each via Anchor API, reports confirmed/missing to #data-billing-updates). Users can ask "which agreements are missing?" or "show flagged agreements" for drill-down details.
-- 12:00 Mon-Fri: Bank holiday profile check (queries landing_billington.bank_holiday_profile_check for agreements with instalments due on UK bank holidays; if ≤10 results, verifies each via Anchor API and reports which are corrected vs still flagged; if >10, posts the full query).
+- 09:00 Tue-Fri / 10:30 Mon: ARUDD bounce report to #data-billing-updates
+- 09:00-17:00 hourly Mon-Fri: Refund approval monitor (detects "approved" in #customer-refunds-and-complaints, verifies the refund posted via Anchor, confirms or chases; offers Post / Process-anyway buttons)
+- 09:05-17:05 hourly Mon-Fri: iOutlet email triage — classifies inbound iOutlet emails in billingoperations@ (cancellation / status / general), labels them, drafts a customer reply, and posts it to #team-billing-operations-emails for review ("send email" in the draft thread sends it)
+- 09:30 Mon-Fri: Hire-agreement audit chaser — chases yesterday's un-actioned audit cards, and RE-CHECKS any card whose validation was deferred because a field was null, updating the card once the data lands
+- 12:00 Mon-Fri: Bank holiday profile check (agreements with instalments due on UK bank holidays; ≤10 → verify each via Anchor, else post the query)
+- 13:00 Mon-Fri: Hire-agreement audit — picks 2 agreements/day (one template-rotation pick for coverage + one most-recently-created), validates each against Anchor (name / email / address / monthly / term / start-date), and posts a card with Pass / Fail / "Billington is incorrect" buttons to #collab-hire-agreement-audit-updates
 - 15:00 Mon-Fri: BACS batch file summary to #data-billing-updates
 - 15:00 Mon-Fri: Notices QA report (LPF/NODS + NOSIA/SNOSIA email QA) to #data-billing-updates
-- 08:40 Mon-Fri: Late fee readiness check — verifies ARUDD >= 99% reconciled, source tables updated today, then counts pending late fees with estimated apply time. Recommends proceeding if all criteria met. Rechecks every 30 min until 3pm if criteria not met. Soft close-band button (Hargo, 13/07/2026): if the ONLY failing criterion is GoCardless reconciliation lagging (Anchor bounces are posted and ahead of GC) while source tables are fresh, Anchor bounces look healthy, and live fees-to-apply is close to the estimate (80–150%), Billington posts a manual "Run Apply Late Fees" button instead of just rechecking — it never auto-fires on that path.
-- 08:00 Tue-Fri / 10:30 Mon: ARUDD bounce report to #data-billing-updates
+- 15:30 Mon-Fri: Missing instalment due control check (flags agreements missing instalment-due transactions, verifies via Anchor; ask "which agreements are missing?" to drill down, or "check all" to re-verify the whole flagged population)
+- 16:00 Mon-Fri: Apply Final Hire Payment campaign
+- 17:00 Mon-Fri: Repair/warranty activation charges campaign (bottom-line pre-flight + Run button)
+- 15:00 on the 4th working day before month-end: Monthly custom re-collection profiles ("custom profiling"). Queries arrears agreements eligible for a supplement Direct Debit re-collection (Direct Debit method; total_arrears ≥ £10; last successful DD on/after last payment date; no returned DD within the last 30 days; ≤ 2 missed payments; not on hold / frozen / DCA / write-off / debt-sale). Amount = ONE month's recurring instalment when arrears > £85, otherwise the full arrears. Posts a bottom-line pre-flight (count + total) with a Run button to #data-billing-updates — NOTHING hits Anchor until an authoriser (Hargo / Charlotte / Ciaran) clicks Run, which posts one Anchor SetupCustomProfile per agreement (one working-day payment, removed when complete). Idempotent per month; holds for review if the population is > 2× last month; agreements set up via "test custom profile" are excluded. Ask "test custom profile [on A00…]" to trial one agreement first.
+- Mon 09:00: Weekly review — DMs Hargo the week's "Billington is incorrect" flags for review
 - Every minute: check and fire pending reminders
-You ALWAYS know about these. If someone asks about your schedule or what you monitor, reference this list.
+You ALWAYS know about these. If someone asks about your schedule or "what scheduled tasks do you run", give the outline of this whole list. If someone asks HOW a specific one works (e.g. "how does custom profiling work?"), give the FULL detail from its entry above — when it runs, what it queries/checks, what it posts, and any human approval gate — not just the one-liner. Never say you don't have it in your knowledge base.
 
 --- ## Make.com Scenarios
 You have access to full documentation of all 186 Make.com billing scenarios via Notion pages. When someone asks about a scenario:
@@ -13323,18 +13329,22 @@ function validateAgreementVsAnchor(candidate, anchorFields) {
   const dispatchDate = (candidate.dispatchedOn || "").slice(0, 10);
   const startEventType = candidate.startEventType || "";
   const initiationCategory = candidate.initiationCategory || "";
-  if (startEventType === "fulfillment_dispatched" && !dispatchDate) {
-    // Signed but not yet dispatched — cannot verify the start date yet; defer.
-    out.push({ label: "Agreement start date (dispatch pending, not yet verifiable)", ok: true, deferred: true });
-  } else {
+  {
     let expected, basis;
     if (startEventType === "fulfillment_dispatched") { expected = dispatchDate; basis = "dispatch date"; }
     else if (initiationCategory === "renewal") { expected = companySignedDate || haSignedDate; basis = "signature date"; }
     else { expected = haSignedDate || companySignedDate; basis = "signature date"; }
-    out.push({
-      label: `Agreement start date (vs ${basis})`,
-      ok: !!expected && !!anchorFields.agreementDate && dayDiff(expected, anchorFields.agreementDate) <= 1,
-    });
+    // If a field we need to verify the start date is NULL — dispatch not yet linked in
+    // the data (order_latest_fulfillment_id null), a signature date missing, or Anchor's
+    // AgreementDate absent — do NOT fail. Flag exactly which field is null and defer; the
+    // daily recheck re-runs it and updates the card once the data lands (Hargo, 24/07/2026).
+    if (!expected) {
+      out.push({ label: `Agreement start date — ${basis} is null, can't verify yet (re-checking next working day)`, ok: true, deferred: true });
+    } else if (!anchorFields.agreementDate) {
+      out.push({ label: `Agreement start date — Anchor AgreementDate is null, can't verify yet (re-checking next working day)`, ok: true, deferred: true });
+    } else {
+      out.push({ label: `Agreement start date (vs ${basis})`, ok: dayDiff(expected, anchorFields.agreementDate) <= 1 });
+    }
   }
   return out;
 }
@@ -13567,6 +13577,10 @@ async function postDailyHireAgreementAudits() {
           chaseSent: false,
           completedAt: null,
           escalatedAt: null,
+          // Snapshot of the candidate so the daily recheck can re-validate + re-render the
+          // SAME agreement if a field was null at post time (Hargo, 24/07/2026).
+          candidate: { ...c },
+          needsRecheck: validationLines.some(l => typeof l === "string" && l.includes("re-checking next working day")),
         });
         // Persist row to the audit sheet (don't block the next post if it fails).
         insertHireAgreementAuditRow({
@@ -13624,6 +13638,28 @@ async function chasePendingHireAgreementAudits() {
   const batchedFails = [];
   for (const a of hireAgreementAudits) {
     if (a.status !== "pending") continue;
+
+    // Daily recheck of a null/deferred field (Hargo, 24/07/2026): if a validation input
+    // was null when the card posted (flagged "re-checking next working day"), re-run the
+    // checks for the SAME agreement now and update the card in place. Once the data lands
+    // the ⏳ flips to ✅/❌; if still null it stays deferred and re-checks again tomorrow.
+    if (a.needsRecheck && a.candidate) {
+      try {
+        const freshLines = await computeHireAuditValidationLines(a.candidate);
+        const stillDeferred = freshLines.some(l => typeof l === "string" && l.includes("re-checking next working day"));
+        const newText = renderHireAuditCardText(a.candidate, freshLines);
+        await app.client.chat.update({ token: SLACK_BOT_TOKEN, channel: a.channel, ts: a.messageTs, text: newText.slice(0, 3000), blocks: buildHireAuditBlocks(newText) });
+        if (!stillDeferred) {
+          a.needsRecheck = false;
+          saveHireAgreementAudits();
+          await app.client.chat.postMessage({ token: SLACK_BOT_TOKEN, channel: a.channel, thread_ts: a.messageTs, text: `🔄 Re-checked *${a.agreementId}* — the field that was null has now landed, card updated above.`, mrkdwn: true, unfurl_links: false, unfurl_media: false }).catch(() => {});
+        } else {
+          console.log(`[bill-ling] Audit recheck: ${a.agreementId} still has a null field — will re-check again next working day.`);
+        }
+      } catch (e) {
+        console.error(`[bill-ling] Audit recheck failed for ${a.agreementId}:`, e.message);
+      }
+    }
 
     // Resilience (Hargo, 18/06/2026): a ✅/❌ reaction added while the bot was
     // restarting (e.g. during a deploy) is dropped by Socket Mode, so the
@@ -23641,13 +23677,22 @@ async function handleMentionEvent(event, say) {
                     figLines.push(`• Denton confirmed total: *£${dentonTotal.toFixed(2)}*`);
                   }
                   const suggest = (dFigs?.difference ?? dentonTotal ?? reconcilable[0]);
+                  const overrideCat = inferGogwCategory(cleanText, contextMessages) || "Full trade in value";
                   reply =
                     `⚠️ *${agreementId}* — *£${amount.toFixed(2)}* doesn't reconcile with Denton's trade-in figures.\n` +
                     `${figLines.join("\n")}\n\n` +
-                    `I won't post until the figure matches one of Denton's numbers. ` +
-                    `Re-issue with the correct amount (e.g. \`post GOGW on ${agreementId} £${suggest.toFixed(2)}\`), ` +
-                    `or, if £${amount.toFixed(2)} really is correct, add \`override\` to the command to post it anyway.`;
-                  await say({ text: reply, thread_ts: thread_ts || ts, mrkdwn: true, unfurl_links: false, unfurl_media: false });
+                    `If *£${amount.toFixed(2)}* is confirmed correct (e.g. a quote-rejected complaint refund at the declared amount), ${BILLINGTON_REFUND_AUTHORISER_NAMES} can *Post anyway* below. Otherwise re-issue with £${suggest.toFixed(2)}.`;
+                  const overrideBtn = {
+                    type: "button", text: { type: "plain_text", text: `⚠️ Post £${amount.toFixed(2)} anyway`, emoji: true }, style: "primary",
+                    action_id: "btn_post_gogw_refund",
+                    value: JSON.stringify({ t: thread_ts || ts, c: channel, amount, category: overrideCat, ag: agreementId }),
+                    confirm: { title: { type: "plain_text", text: "Post despite the mismatch?" }, text: { type: "mrkdwn", text: `£${amount.toFixed(2)} doesn't exactly match Denton's figures. This posts *GOGW £${amount.toFixed(2)} + refund £${amount.toFixed(2)}* (${overrideCat}) anyway, after the usual live pre-checks (arrears, existing TypeId 61, already-processed). Only do this if the amount is confirmed correct.` }, confirm: { type: "plain_text", text: `Post £${amount.toFixed(2)}` }, deny: { type: "plain_text", text: "Cancel" } },
+                  };
+                  const reconcileBlocks = [
+                    { type: "section", text: { type: "mrkdwn", text: reply } },
+                    { type: "actions", elements: [overrideBtn, billingtonIncorrectButton()] },
+                  ];
+                  await app.client.chat.postMessage({ token: SLACK_BOT_TOKEN, channel, thread_ts: thread_ts || ts, text: reply, blocks: reconcileBlocks, mrkdwn: true, unfurl_links: false, unfurl_media: false });
                   return;
                 }
                 console.log(`[bill-ling] Denton reconciliation OK for ${agreementId}: £${amount.toFixed(2)} matches one of [${reconcilable.map(v => v.toFixed(2)).join(", ")}]`);
@@ -25856,6 +25901,10 @@ app.action("btn_audit_pass", async ({ body, ack, client }) => {
     try {
       const kept = (body.message?.blocks || []).filter(b => b.type !== "actions");
       kept.push({ type: "context", elements: [{ type: "mrkdwn", text: `✅ Passed by <@${user}>.` }] });
+      // Keep the "Billington is incorrect" flag available AFTER the decision — a pass/fail
+      // is the outcome, but the operator may still want to flag Billington's assessment as
+      // wrong (e.g. a false start-date mismatch). Only the Pass/Fail buttons are removed.
+      kept.push({ type: "actions", elements: [billingtonIncorrectButton()] });
       await client.chat.update({ token: SLACK_BOT_TOKEN, channel: ch, ts, text: body.message?.text || "Audit passed.", blocks: kept });
     } catch (_) {}
     await markHireAgreementAuditComplete(audit, user, "button_pass");
@@ -25878,6 +25927,8 @@ app.action("btn_audit_fail", async ({ body, ack, client }) => {
     try {
       const kept = (body.message?.blocks || []).filter(b => b.type !== "actions");
       kept.push({ type: "context", elements: [{ type: "mrkdwn", text: `❌ Marked Fail by <@${user}> — escalating.` }] });
+      // Keep the "Billington is incorrect" flag available after the decision (see btn_audit_pass).
+      kept.push({ type: "actions", elements: [billingtonIncorrectButton()] });
       await client.chat.update({ token: SLACK_BOT_TOKEN, channel: ch, ts, text: body.message?.text || "Audit failed.", blocks: kept });
     } catch (_) {}
     await escalateHireAgreementAuditFail(audit, `❌ Fail button by <@${user}>`, {
