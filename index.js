@@ -4292,6 +4292,17 @@ ${threadText}`;
 // ---------------------------------------------------------------------------
 const WRITEOFF_SCAN_FILE = require("path").join(__dirname, "writeoff-approval-scan.json");
 const WRITEOFF_SCAN_GCS_KEY = "writeoff-approval-scan.json";
+// Outcomes that mean an agreement is DONE for this thread — the scan won't re-evaluate
+// these. Everything else (notably flagged_open_refund_question / flagged_refund_due) is a
+// TEMPORARY hold, so it IS re-evaluated on later scans and unblocks itself once the refund
+// question resolves / it gets approved / the agreement comes back on Anchor (Hargo,
+// 29/07/2026 — A00111046 stayed parked on flagged_open_refund_question after it was
+// approved, pulled back from Perch and moved to VC hold).
+const WRITEOFF_TERMINAL_OUTCOMES = new Set([
+  "already_closed_in_anchor", "context_only_closed_in_anchor", "already_in_sheet",
+  "added_to_sheet_no_refund_needed", "added_to_sheet_refund_processed", "retracted", "context_only_skipped",
+]);
+const isWriteoffStateTerminal = (e) => !!e && WRITEOFF_TERMINAL_OUTCOMES.has(e.outcome);
 // 30 days, not 7 (Hargo, 07/07/2026). Deceased/complaint write-offs routinely
 // wait 1-2+ weeks for death certs, third-party confirmation and sign-off, so
 // the APPROVAL often lands well after the request. A 7-day window meant threads
@@ -4565,7 +4576,7 @@ async function runWriteoffApprovalScan(opts = {}) {
       // Quick pre-filter — if EVERY agreement has already been handled for
       // this thread, skip without an LLM call.
       summary.threadsScanned++;
-      const allHandled = agreementIds.every(agId => writeoffScanState.has(`${ch.id}:${thread_ts}:${agId}`));
+      const allHandled = agreementIds.every(agId => isWriteoffStateTerminal(writeoffScanState.get(`${ch.id}:${thread_ts}:${agId}`)));
       if (allHandled) { summary.alreadyHandled++; continue; }
 
       // Classify (LLM)
@@ -4732,7 +4743,7 @@ async function runWriteoffApprovalScan(opts = {}) {
       // Per-agreement processing — ONLY targets explicitly requested
       for (const agId of targetAgreementIds) {
         const key = `${ch.id}:${thread_ts}:${agId}`;
-        if (writeoffScanState.has(key)) continue;
+        if (isWriteoffStateTerminal(writeoffScanState.get(key))) continue;
 
         // RULE 1 (Hargo, 22/05/2026): Anchor write-off pre-check FIRST.
         // If TypeId 26 or 70 is already on Anchor, post a single factual
@@ -4785,21 +4796,31 @@ async function runWriteoffApprovalScan(opts = {}) {
         //   - No refund discussion at all: add straight to the sheet under
         //     Fraud & VC Write Off (no payment check needed).
         if (openRefundQuestion) {
-          const permaQuote = openRefundQuestionQuote ? `\n*Question raised:* "${openRefundQuestionQuote}"` : "";
-          const flagText =
-            `❓ *Blocked* — unresolved refund question on an approved write-off.\n\n` +
-            `*Agreement:* ${agId}\n` +
-            `*Approver:* ${approverName}${amount ? ` (£${amount.toFixed(2)})` : ""}\n` +
-            `*Source:* ${threadRef} in #${ch.name}${permaQuote}\n\n` +
-            `Not added to the close sheet.`;
-          try {
-            await sendDM(HARGO_USER_ID, flagText);
-            writeoffScanState.set(key, { outcome: "flagged_open_refund_question", at: new Date().toISOString() });
-            stateDirty = true;
-            summary.blockedOpenQuestion.push(agId);
-          } catch (err) {
-            console.error(`[bill-ling] writeoff-scan: open-question DM failed for ${agId}:`, err.message);
+          // Non-terminal — re-evaluated every scan (Hargo, 29/07/2026) so it self-clears
+          // once the refund question resolves / the thread gets re-approved / the agreement
+          // comes back on Anchor. Re-classifying hourly means a STILL-open question would
+          // otherwise re-DM Hargo every hour; only re-notify if it's been >20h since the
+          // last flag on this exact key (once-daily heads-up), not on every re-scan.
+          const priorFlag = writeoffScanState.get(key);
+          const hoursSinceLastFlag = (priorFlag && priorFlag.outcome === "flagged_open_refund_question")
+            ? (Date.now() - new Date(priorFlag.at).getTime()) / 3_600_000 : Infinity;
+          if (hoursSinceLastFlag > 20) {
+            const permaQuote = openRefundQuestionQuote ? `\n*Question raised:* "${openRefundQuestionQuote}"` : "";
+            const flagText =
+              `❓ *Blocked* — unresolved refund question on an approved write-off.\n\n` +
+              `*Agreement:* ${agId}\n` +
+              `*Approver:* ${approverName}${amount ? ` (£${amount.toFixed(2)})` : ""}\n` +
+              `*Source:* ${threadRef} in #${ch.name}${permaQuote}\n\n` +
+              `Not added to the close sheet.`;
+            try {
+              await sendDM(HARGO_USER_ID, flagText);
+              writeoffScanState.set(key, { outcome: "flagged_open_refund_question", at: new Date().toISOString() });
+              stateDirty = true;
+            } catch (err) {
+              console.error(`[bill-ling] writeoff-scan: open-question DM failed for ${agId}:`, err.message);
+            }
           }
+          summary.blockedOpenQuestion.push(agId);
           continue;
         }
         if (!refundRequested) {
@@ -4856,33 +4877,39 @@ async function runWriteoffApprovalScan(opts = {}) {
               console.error(`[bill-ling] writeoff-scan: writeCloseAgreements failed for ${agId}:`, err.message);
             }
           } else {
-            // Refund due but not processed — DO NOT add to sheet; flag.
-            const breakdownLines = [];
-            for (const [tid, e] of [...breakdown.entries()].sort((a,b)=>a[0]-b[0])) {
-              const desc = (TRANSACTION_TYPES?.[tid]) || `TypeId ${tid}`;
-              breakdownLines.push(`  • TypeId ${tid} (${desc}) — ${e.count} txn(s), gross £${e.sum.toFixed(2)}`);
+            // Refund due but not processed — DO NOT add to sheet; flag. Non-terminal, same
+            // re-evaluate-but-don't-spam cooldown as flagged_open_refund_question above.
+            const priorFlag = writeoffScanState.get(key);
+            const hoursSinceLastFlag = (priorFlag && priorFlag.outcome === "flagged_refund_due")
+              ? (Date.now() - new Date(priorFlag.at).getTime()) / 3_600_000 : Infinity;
+            if (hoursSinceLastFlag > 20) {
+              const breakdownLines = [];
+              for (const [tid, e] of [...breakdown.entries()].sort((a,b)=>a[0]-b[0])) {
+                const desc = (TRANSACTION_TYPES?.[tid]) || `TypeId ${tid}`;
+                breakdownLines.push(`  • TypeId ${tid} (${desc}) — ${e.count} txn(s), gross £${e.sum.toFixed(2)}`);
+              }
+              const flagText =
+                `🚨 *Blocked* — write-off approved but refund directive not yet processed.\n\n` +
+                `*Agreement:* ${agId}\n` +
+                `*Approver:* ${approverName}${amount ? ` (£${amount.toFixed(2)})` : ""}\n` +
+                (refundAmount ? `*Refund directive:* £${refundAmount.toFixed(2)}\n` : "") +
+                `*Source:* ${threadRef} in #${ch.name}\n` +
+                `*Net unrefunded cash:* *£${net.toFixed(2)}*\n` +
+                (breakdownLines.length ? `\nBreakdown:\n${breakdownLines.join("\n")}\n` : "") +
+                `\nNot added to the close sheet.`;
+              try {
+                await Promise.all([
+                  sendDM(CIARAN_DOBBIN_USER_ID, flagText),
+                  sendDM(CHARLOTTE_PLATT_USER_ID, flagText),
+                  sendDM(HARGO_USER_ID, flagText),
+                ]);
+                writeoffScanState.set(key, { outcome: "flagged_refund_due", net, at: new Date().toISOString() });
+                stateDirty = true;
+              } catch (err) {
+                console.error(`[bill-ling] writeoff-scan: flag DMs failed for ${agId}:`, err.message);
+              }
             }
-            const flagText =
-              `🚨 *Blocked* — write-off approved but refund directive not yet processed.\n\n` +
-              `*Agreement:* ${agId}\n` +
-              `*Approver:* ${approverName}${amount ? ` (£${amount.toFixed(2)})` : ""}\n` +
-              (refundAmount ? `*Refund directive:* £${refundAmount.toFixed(2)}\n` : "") +
-              `*Source:* ${threadRef} in #${ch.name}\n` +
-              `*Net unrefunded cash:* *£${net.toFixed(2)}*\n` +
-              (breakdownLines.length ? `\nBreakdown:\n${breakdownLines.join("\n")}\n` : "") +
-              `\nNot added to the close sheet.`;
-            try {
-              await Promise.all([
-                sendDM(CIARAN_DOBBIN_USER_ID, flagText),
-                sendDM(CHARLOTTE_PLATT_USER_ID, flagText),
-                sendDM(HARGO_USER_ID, flagText),
-              ]);
-              writeoffScanState.set(key, { outcome: "flagged_refund_due", net, at: new Date().toISOString() });
-              stateDirty = true;
-              summary.blockedRefundDue.push(agId);
-            } catch (err) {
-              console.error(`[bill-ling] writeoff-scan: flag DMs failed for ${agId}:`, err.message);
-            }
+            summary.blockedRefundDue.push(agId);
           }
         }
       }
