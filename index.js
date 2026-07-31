@@ -566,7 +566,7 @@ You have the following cron jobs that run automatically:
 - 08:00 Mon-Fri: Refund summary + thread chasers to #customer-refunds-and-complaints
 - 08:05 Mon-Fri: Make.com operations usage check to #data-billing-updates (flags if projected to exceed 90% of monthly limit)
 - 08:10 daily: Combined finance balance check (Stannp + GoCardless) to #collab-finance-customer-ops ONLY. SILENT when both accounts are healthy — it only posts an account that needs a top up. Urgency is tiered by WORKING DAYS to runout (👁️ soon / ⚠️ warning / 🚨 alert); ⚠️/🚨 posts add a "Confirm account topped up" button and @-mention Peter Lundy. Stannp runout = 60-day burn-rate projection; GoCardless runout = exact draw-down of the live balance against scheduled future trade-in payments. Ask "what's the GoCardless / Stannp balance?" to run either on demand.
-- 08:40 Mon-Fri: Late fee readiness check — verifies ARUDD >= 99% reconciled + source tables fresh, counts pending late fees, and AUTO-FIRES the Apply Late Fees Make scenario when every criterion is green (standing consent); otherwise rechecks every 30 min until 15:00. Soft close-band: if the only lag is GoCardless reconciliation while Anchor bounces look healthy, it posts a manual "Run Apply Late Fees" button instead of auto-firing.
+- 08:40 Mon-Fri: Late fee readiness check — verifies ARUDD >= 99% reconciled + source tables fresh (resolved via real BigQuery lineage, not a hardcoded list — see below), always shows the estimated fee count AND the live query count regardless of gate status, and AUTO-FIRES the Apply Late Fees Make scenario when every criterion is green (standing consent); otherwise rechecks every 30 min until 15:00. Override: if the live fees-to-apply count is >= 90% of the estimate, it posts a manual "Run Apply Late Fees" button regardless of which specific criterion is still failing — never auto-fires on this path, a human must press it.
 - 09:00 Mon-Fri: BACS batch forecast to #data-billing-updates
 - 09:00 Tue-Fri / 10:30 Mon: ARUDD bounce report to #data-billing-updates
 - 09:00-17:00 hourly Mon-Fri: Refund approval monitor (detects "approved" in #customer-refunds-and-complaints, verifies the refund posted via Anchor, confirms or chases; offers Post / Process-anyway buttons)
@@ -6069,7 +6069,7 @@ Rules:
   - Single table/view: SELECT TIMESTAMP_MILLIS(last_modified_time) as last_modified FROM \`raylo-production.landing_billington.__TABLES__\` WHERE table_id = 'table_name'
   - For other datasets: replace landing_billington with the correct dataset name (e.g. dbt_production)
   - table_type values: TABLE = base table, VIEW = view
-  - IMPORTANT: if the question asks about SOURCE TABLES of a view, OR asks "when was bacs_monitoring last updated/modified/refreshed", OR asks about the freshness/staleness of bacs_monitoring or any other landing_billington view — return the special token VIEW_SOURCE_LOOKUP:landing_billington:<view_name> and nothing else. e.g. VIEW_SOURCE_LOOKUP:landing_billington:bacs_monitoring or VIEW_SOURCE_LOOKUP:landing_billington:bacs_monitoring_mandates. These are VIEWs whose data comes from source tables; their freshness = the freshness of those source tables. The response will also include key upstream tables like core_subscriptions and core_payment_profiles.
+  - IMPORTANT: if the question asks about SOURCE TABLES of a view, OR asks "when was bacs_monitoring last updated/modified/refreshed", OR asks about the freshness/staleness of bacs_monitoring or any other view (in landing_billington, dbt_production, or elsewhere) — return the special token VIEW_SOURCE_LOOKUP:<dataset>:<view_name> and nothing else. e.g. VIEW_SOURCE_LOOKUP:landing_billington:bacs_monitoring or VIEW_SOURCE_LOOKUP:dbt_production:collections_controls_late_payment_fees_to_apply. This resolves the REAL lineage via a deterministic recursive walk of BigQuery's own INFORMATION_SCHEMA (no guessing, no hallucinated table names) — if the named object is itself a view over further views, it keeps walking down until it hits genuine BASE TABLEs, and shows the full chain plus each base table's actual last-modified time. Many dbt_production/landing_billington objects that used to be base tables have since been converted to views (Hargo, 31/07/2026) — a view's own last-modified reflects when its SQL was last edited, NOT data freshness, so always resolve to the base tables for a real freshness answer.
 - ARUDD mismatch queries: anchor_bounces = instalment_direct_debits_bounced_count + recollection_direct_debits_bounced_count + repair_direct_debits_bounced_count. gc_failed = total_failed_go_cardless. A mismatch = WHERE (instalment_direct_debits_bounced_count + recollection_direct_debits_bounced_count + repair_direct_debits_bounced_count) != total_failed_go_cardless. Always filter to rows where (collection_batch_created_at IS NOT NULL OR recollection_batch_created_at IS NOT NULL) (i.e. a file was actually generated). IMPORTANT: future dates (due_date > CURRENT_DATE()) will always show zero anchor bounces because the ARUDD file hasn't been processed into Anchor yet — this is expected, not a mismatch. For mismatch queries, always add AND due_date <= CURRENT_DATE() to exclude future dates from the mismatch comparison. If the user asks to see future dates separately, include them but label them clearly as 'pending — not yet due' (batch/GC data exists but Anchor bounce data will be 0 until the due date passes).
 - AGREEMENT-LEVEL BACS DATA: \`raylo-production.landing_billington.bacs_monitoring_agreement_level\` has one row per BACS transmission, joined across the full payment lifecycle. Use this table to:
   (a) Drill down when bacs_monitoring shows discrepancies — find WHICH specific agreements/payments have issues
@@ -8953,61 +8953,93 @@ async function buildAruddReport(targetDueDate = null) {
  * source table references, then looks up each table's last_modified time.
  * Returns a formatted string.
  */
+// ---------------------------------------------------------------------------
+// Deterministic table/view LINEAGE resolver (Hargo, 31/07/2026). Many
+// landing_billington / dbt_production objects that used to be base tables have
+// been swapped to VIEWS over time (e.g. collections_controls_late_payment_fees_to_apply
+// is now a view over collections_controls_late_payment_fees_to_apply_anchor_with_retrospective,
+// which is itself a view over 5 real base tables). Checking a VIEW's own
+// __TABLES__.last_modified_time is checking the wrong thing — it reflects when the
+// view's SQL was last (re)defined, not when its underlying data last refreshed.
+// This resolver walks INFORMATION_SCHEMA.TABLES/.VIEWS recursively (NO LLM — pure
+// regex over the view SQL, so it can't hallucinate a wrong source table) down to
+// the real BASE TABLE leaves, so freshness checks and "what feeds this view"
+// questions are always looking at the thing that's actually re-populated.
+async function getTableMeta(project, dataset, table) {
+  const typeRows = await runBigQueryRaw(`SELECT table_type FROM \`${project}.${dataset}.INFORMATION_SCHEMA.TABLES\` WHERE table_name = '${table}'`);
+  if (!typeRows.length) return { type: null, lastModified: null };
+  const type = formatBQValue(typeRows[0].table_type);
+  if (type !== "BASE TABLE") return { type, lastModified: null };
+  const metaRows = await runBigQueryRaw(`SELECT TIMESTAMP_MILLIS(last_modified_time) AS last_modified FROM \`${project}.${dataset}.__TABLES__\` WHERE table_id = '${table}'`);
+  return { type, lastModified: metaRows.length ? formatBQValue(metaRows[0].last_modified) : null };
+}
+
+async function getViewDefinitionSQL(project, dataset, table) {
+  const rows = await runBigQueryRaw(`SELECT view_definition FROM \`${project}.${dataset}.INFORMATION_SCHEMA.VIEWS\` WHERE table_name = '${table}'`);
+  return rows.length ? formatBQValue(rows[0].view_definition) : null;
+}
+
+// Extracts fully-qualified `project`.`dataset`.`table` (or single-backtick
+// `project.dataset.table`) references from a view's SQL text. Deterministic —
+// no LLM involved, so no risk of a hallucinated source table.
+function extractTableRefsFromSql(sql) {
+  const refs = new Set();
+  for (const m of (sql || "").matchAll(/`([\w-]+)`\.`([\w-]+)`\.`([\w-]+)`/g)) refs.add(`${m[1]}.${m[2]}.${m[3]}`);
+  for (const m of (sql || "").matchAll(/`([\w-]+\.[\w-]+\.[\w-]+)`/g)) refs.add(m[1]);
+  return [...refs];
+}
+
+// Recursively resolves project.dataset.table down to its BASE TABLE leaves.
+// Returns a tree: { project, dataset, table, type, lastModified, children }.
+// Depth-capped and cycle-safe (shared `visited` set across the whole recursion).
+async function buildLineageTree(project, dataset, table, visited = new Set(), depth = 0) {
+  const key = `${project}.${dataset}.${table}`;
+  const node = { project, dataset, table, type: null, lastModified: null, children: [] };
+  if (visited.has(key)) { node.type = "CYCLE (already seen)"; return node; }
+  visited.add(key);
+  if (depth > 6) { node.type = "UNRESOLVED (lineage too deep)"; return node; }
+  const meta = await getTableMeta(project, dataset, table);
+  node.type = meta.type || "NOT FOUND";
+  node.lastModified = meta.lastModified;
+  if (node.type === "VIEW") {
+    const viewSql = await getViewDefinitionSQL(project, dataset, table);
+    const refs = extractTableRefsFromSql(viewSql);
+    for (const ref of refs) {
+      const parts = ref.split(".");
+      const [p, d, t] = parts.length === 3 ? parts : [project, parts[0], parts[1]];
+      node.children.push(await buildLineageTree(p, d, t, visited, depth + 1));
+    }
+  }
+  return node;
+}
+
+function flattenBaseTables(node, out = []) {
+  if (node.type === "BASE TABLE") { out.push(node); return out; }
+  for (const c of node.children || []) flattenBaseTables(c, out);
+  return out;
+}
+
+const fmtLastModified = (iso) => iso
+  ? new Date(iso).toLocaleString("en-GB", { timeZone: "Europe/London", day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit" })
+  : "unknown";
+
+function renderLineageTree(node, indent = "") {
+  const lm = node.type === "BASE TABLE" ? ` — last modified ${fmtLastModified(node.lastModified)}` : "";
+  const lines = [`${indent}${indent ? "→ " : ""}\`${node.dataset}.${node.table}\` (${node.type})${lm}`];
+  for (const c of node.children || []) lines.push(...renderLineageTree(c, indent + "  "));
+  return lines;
+}
+
 async function getViewSourceMetadata(dataset, viewName) {
-  // Step 1: fetch the view SQL definition from INFORMATION_SCHEMA
-  const defSQL = `SELECT view_definition FROM \`raylo-production.${dataset}.INFORMATION_SCHEMA.VIEWS\` WHERE table_name = '${viewName}'`;
-  const [defRows] = await bigquery.query({ query: defSQL, location: "EU" });
-  if (!defRows.length) return `No view named \`${viewName}\` found in \`${dataset}\`.`;
-  const viewDef = defRows[0].view_definition;
-
-  // Step 2: ask Claude to extract all table references from the view SQL
-  const extractPrompt = `Extract every unique BigQuery table reference from this SQL view definition. Include backtick-quoted references in formats: \`project.dataset.table\`, \`dataset.table\`. Exclude CTEs (WITH clause aliases) — only real table/dataset paths. Return ONLY a JSON array of fully-qualified strings like ["project.dataset.table"], no markdown, no explanation:\n\n${viewDef}`;
-  const rawList = await askClaude(extractPrompt);
-  let tableRefs = [];
-  try {
-    tableRefs = JSON.parse(rawList.trim().replace(/^```json?\n?/i, "").replace(/\n?```$/, ""));
-  } catch (_) {
-    tableRefs = (rawList.match(/`[^`]+\.[^`]+\.[^`]+`/g) || []).map(s => s.replace(/`/g, ""));
-  }
-
-  if (!tableRefs || !tableRefs.length) return `Could not extract source tables from \`${viewName}\` definition.`;
-
-  // Step 2b: include key upstream tables that feed into BACS monitoring views
-  const EXTRA_UPSTREAM_TABLES = [
-    "raylo-production.dbt_production.core_subscriptions",
-    "raylo-production.dbt_production.core_payment_profiles",
-  ];
-  for (const extra of EXTRA_UPSTREAM_TABLES) {
-    if (!tableRefs.some(r => r.replace(/`/g, "") === extra)) {
-      tableRefs.push(extra);
-    }
-  }
-
-  // Step 3: for each table ref, query __TABLES__ for last_modified (in parallel)
-  const results = await Promise.all(tableRefs.map(async (ref) => {
-    const clean = ref.replace(/`/g, "").trim();
-    const parts = clean.split(".");
-    let proj = "raylo-production", ds, tbl;
-    if (parts.length === 3) { [proj, ds, tbl] = parts; }
-    else if (parts.length === 2) { [ds, tbl] = parts; }
-    else { ds = dataset; tbl = parts[0]; }
-
-    try {
-      const metaSQL = `SELECT TIMESTAMP_MILLIS(last_modified_time) as last_modified, row_count, type FROM \`${proj}.${ds}.__TABLES__\` WHERE table_id = '${tbl}'`;
-      const [metaRows] = await bigquery.query({ query: metaSQL, location: "EU" });
-      if (metaRows.length) {
-        const lm = formatBQValue(metaRows[0].last_modified);
-        const dt = new Date(lm).toLocaleString("en-GB", { timeZone: "Europe/London", day: "2-digit", month: "2-digit", year: "numeric", hour: "2-digit", minute: "2-digit" });
-        return `• \`${proj}.${ds}.${tbl}\` — last modified: ${dt}`;
-      } else {
-        return `• \`${proj}.${ds}.${tbl}\` — not found in __TABLES__`;
-      }
-    } catch (e) {
-      return `• \`${proj}.${ds}.${tbl}\` — error: ${e.message}`;
-    }
-  }));
-
-  return `*Source tables for \`${dataset}.${viewName}\`:*\n\n${results.join("\n")}`;
+  const tree = await buildLineageTree("raylo-production", dataset, viewName);
+  if (tree.type === "NOT FOUND") return `No table/view named \`${viewName}\` found in \`${dataset}\`.`;
+  const treeLines = renderLineageTree(tree);
+  const baseTables = flattenBaseTables(tree);
+  const summary = baseTables.length
+    ? `\n\n*Base (source) tables actually feeding this ${tree.type === "VIEW" ? "view" : "table"} — check THESE for freshness, not the view itself:*\n` +
+      baseTables.map(b => `• \`${b.dataset}.${b.table}\` — last modified ${fmtLastModified(b.lastModified)}`).join("\n")
+    : "";
+  return `*Lineage for \`${dataset}.${viewName}\`:*\n${treeLines.join("\n")}${summary}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -12046,6 +12078,28 @@ function parseLateFeeHoldDate(text) {
 loadLateFeeHoldsLocal();
 loadLateFeeHoldsGcs();
 
+// Resolves collections_controls_late_payment_fees_to_apply's TRUE base-table
+// lineage (it's a view, 2 levels deep) once per day and caches it — the view's
+// SQL shape is stable day to day, only the data changes, so there's no need to
+// re-walk INFORMATION_SCHEMA on every 30-min recheck (Hargo, 31/07/2026).
+let lateFeeSourceLineageCache = null; // { date, tables: [{dataset, table, label}] }
+async function getLateFeeSourceBaseTables() {
+  const today = new Date().toLocaleDateString("en-CA", { timeZone: "Europe/London" });
+  if (lateFeeSourceLineageCache && lateFeeSourceLineageCache.date === today) return lateFeeSourceLineageCache.tables;
+  try {
+    const tree = await buildLineageTree("raylo-production", "dbt_production", "collections_controls_late_payment_fees_to_apply");
+    const leaves = flattenBaseTables(tree);
+    const tables = leaves.length
+      ? leaves.map(l => ({ dataset: l.dataset, table: l.table, label: `pending_late_fees source (${l.table})` }))
+      : [{ dataset: "dbt_production", table: "collections_controls_late_payment_fees_to_apply", label: "pending_late_fees source" }]; // fallback if lineage resolution fails
+    lateFeeSourceLineageCache = { date: today, tables };
+    return tables;
+  } catch (err) {
+    console.error("[bill-ling] getLateFeeSourceBaseTables lineage resolution failed:", err.message);
+    return [{ dataset: "dbt_production", table: "collections_controls_late_payment_fees_to_apply", label: "pending_late_fees source" }];
+  }
+}
+
 /**
  * Run the late fee readiness check. Posts to #data-billing-updates.
  * If criteria not met, schedules a recheck in 30 minutes (until 15:00).
@@ -12165,10 +12219,16 @@ async function runLateFeeReadinessCheck() {
   // --- 2. Source table freshness check ---
   // Just confirm tables have been updated today (after midnight London).
   // The ARUDD 100% reconciliation is the real gate; this is a sanity check.
+  // collections_controls_late_payment_fees_to_apply is now a VIEW (2 levels deep,
+  // over 5 real base tables) — checking ITS __TABLES__ timestamp checks when the
+  // view SQL was last defined, not when the underlying data refreshed (Hargo,
+  // 31/07/2026). Resolve its true base-table lineage via getLateFeeSourceBaseTables()
+  // (cached per day — the view's SQL shape doesn't change day to day, only the data).
+  const lateFeeSourceTables = await getLateFeeSourceBaseTables();
   const tablesToCheck = [
     { dataset: "dbt_production", table: "core_subscriptions", label: "core_subscriptions" },
     { dataset: "dbt_production", table: "core_payment_profiles", label: "core_payment_profiles" },
-    { dataset: "dbt_production", table: "collections_controls_late_payment_fees_to_apply", label: "pending_late_fees source" },
+    ...lateFeeSourceTables,
   ];
 
   const isBST = new Date().toLocaleString("en-GB", { timeZone: "Europe/London", timeZoneName: "short" }).includes("BST");
@@ -12211,12 +12271,15 @@ async function runLateFeeReadinessCheck() {
     allCriteriaMet = false;
   }
 
+  // Snapshot of the "why isn't this green" reasons so far (ARUDD + source tables),
+  // for the generalised override button's messaging below.
+  const failingReasonsSoFar = lines.filter(l => l.startsWith("❌") || l.startsWith("⚠️"));
+
   // --- 3. Pending late fees count + estimated time ---
-  // Run when strict criteria pass, OR on the soft GC-lag path (Anchor bounces
-  // posted & healthy, source tables fresh) so we can compare the live fees-to-
-  // apply count against the estimate for the manual button (Hargo, 13/07/2026).
-  const runPendingFeesCheck = allCriteriaMet || (aruddGcLag && sourceTablesFresh && aruddBounceRateHealthy);
-  if (runPendingFeesCheck) {
+  // ALWAYS run this now (Hargo, 31/07/2026) — regardless of whether the readiness
+  // gate is green, ops want to see the expected estimate AND the live query count
+  // so they can judge for themselves whether to use the override button below.
+  {
     try {
       const [pendingRows, timingRows] = await Promise.all([
         // Use the precise "fees to apply" query with all Make.com run conditions applied:
@@ -12332,33 +12395,46 @@ async function runLateFeeReadinessCheck() {
           lines.push(`<@${HARGO_USER_ID}> ⚠️ All other criteria met, but *pending late fees is still 0* at the 12:30 cutoff — not auto-applying today. If fees were expected, escalate to ${OPS_STRATEGY_ESCALATION_MENTIONS}.`);
         }
       }
-      } // end if (allCriteriaMet) — strict green display + auto-trigger
+      } else {
+        // Criteria not (yet) met — ALWAYS show what the live query found vs the
+        // estimate anyway (Hargo, 31/07/2026), independent of which specific
+        // criterion is failing, so ops can judge for themselves. The override
+        // button (>=90% of estimate) is decided further down using these numbers.
+        lines.push(``);
+        lines.push(`*Pending Late Fees (live query, criteria not yet green):*`);
+        lines.push(`  › ${volume.toLocaleString("en-GB")} agreement${volume === 1 ? "" : "s"} — £${totalAmount.toLocaleString("en-GB")}`);
+        if (instDateStr) lines.push(`  › Instalment date: ${instDateStr}`);
+        if (estTime !== "unknown") lines.push(`  › Estimated time to apply: ~${estTime}`);
+        if (estVolume > 0) {
+          const pct = Math.round((volume / estVolume) * 100);
+          lines.push(`  › Estimate: ${Math.round(estVolume).toLocaleString("en-GB")} (currently ${pct}% of estimate)`);
+        } else {
+          lines.push(`  › Estimate: unknown`);
+        }
+      } // end if (allCriteriaMet) / else — pending-fees display
     } catch (err) {
       lines.push(`❌ Pending late fees check failed: ${err.message}`);
       allCriteriaMet = false;
     }
   }
 
-  // Soft close-band gate (Hargo, 13/07/2026): the ONLY thing failing is ARUDD/GC
-  // reconciliation (GC lagging behind Anchor), source tables are fresh, Anchor
-  // bounces are posted & healthy, and live fees-to-apply is close to the estimate
-  // (within −20%/+50%). In that case offer a manual Run button instead of just
-  // rechecking. "close" = 80%–150% of the estimate.
+  // Generalised override (Hargo, 31/07/2026): if live fees-to-apply is >= 90% of
+  // the estimate, offer the manual "Run Apply Late Fees" button regardless of
+  // WHICH specific criterion is still failing — broader than the old GC-lag-only
+  // soft path (which required GC reconciliation to be the ONLY failing signal).
+  // The Pending Late Fees numbers are already shown above; this just decides
+  // whether to offer the override and states why the gate isn't green so a human
+  // can make an informed call before pressing it.
   const closeRatio = pendingEstVolume > 0 ? pendingVolume / pendingEstVolume : 0;
-  const feesCloseToEstimate = pendingEstVolume > 0 && pendingVolume > 0 && closeRatio >= 0.8 && closeRatio <= 1.5;
-  const softButtonEligible = !allCriteriaMet && aruddGcLag && sourceTablesFresh
-    && aruddBounceRateHealthy && anchorBouncesCount > 0 && feesCloseToEstimate;
+  const feeVolumeReadyOverride = !allCriteriaMet && pendingEstVolume > 0 && pendingVolume > 0 && closeRatio >= 0.9;
 
   if (!allCriteriaMet) {
-    if (softButtonEligible) {
+    if (feeVolumeReadyOverride) {
       const pct = Math.round(closeRatio * 100);
       lines.push(``);
-      lines.push(`*Pending Late Fees:*`);
-      lines.push(`  › ${pendingVolume.toLocaleString("en-GB")} agreement${pendingVolume === 1 ? "" : "s"} — £${pendingTotalAmount.toLocaleString("en-GB")}`);
-      if (pendingInstDateStr) lines.push(`  › Instalment date: ${pendingInstDateStr}`);
-      if (pendingTimeEst !== "unknown") lines.push(`  › Estimated time to apply: ~${pendingTimeEst}`);
-      lines.push(``);
-      lines.push(`🟡 *GoCardless reconciliation is still catching up, but the real signals are ready:* Anchor has ${anchorBouncesCount.toLocaleString("en-GB")} bounces posted and fees to apply (${pendingVolume.toLocaleString("en-GB")}) is ${pct}% of the estimate (${Math.round(pendingEstVolume).toLocaleString("en-GB")}). Not auto-firing — press the button below when you're happy for me to run it.`);
+      lines.push(`🟡 *Fees to apply (${pendingVolume.toLocaleString("en-GB")}) are ${pct}% of the estimate (${Math.round(pendingEstVolume).toLocaleString("en-GB")}) — over the 90% threshold.* Not auto-firing because:`);
+      for (const r of failingReasonsSoFar) lines.push(`  ${r}`);
+      lines.push(`Press the button below if you're happy for me to run it now.`);
     } else {
       const londonHour = Number(new Date().toLocaleString("en-GB", { timeZone: "Europe/London", hour: "2-digit", hour12: false }));
       const londonMin = Number(new Date().toLocaleString("en-GB", { timeZone: "Europe/London", minute: "2-digit" }));
@@ -12518,17 +12594,18 @@ async function runLateFeeReadinessCheck() {
       }
     }
 
-    // Soft close-band button (Hargo, 13/07/2026): strict criteria not fully met
-    // (GC reconciliation lagging) but the real signals are ready — Anchor bounces
-    // posted & healthy and fees-to-apply close to the estimate. Post a manual Run
-    // button ONCE; never auto-fire on this path. The button press is the trigger,
-    // so mark the day triggered to avoid a later auto-fire double-run if GC
-    // reconciliation catches up on a subsequent recheck.
-    if (softButtonEligible && lateFeeButtonOfferedForDate !== todayStr) {
+    // Generalised override button (Hargo, 31/07/2026): strict criteria aren't fully
+    // met, but live fees-to-apply is >= 90% of the estimate regardless of WHICH
+    // criterion is failing (replaces the old GC-lag-only soft path). Post a manual
+    // Run button ONCE; never auto-fire on this path — the button press is the
+    // trigger, so mark the day triggered to avoid a later auto-fire double-run if
+    // the failing criterion clears on a subsequent recheck.
+    if (feeVolumeReadyOverride && lateFeeButtonOfferedForDate !== todayStr) {
       lateFeeButtonOfferedForDate = todayStr;
       lateFeeAutoTriggeredToday = true;
       try {
-        const softText = `🟡 *Apply Late Fees — ready to run (manual confirm).* GoCardless reconciliation is still catching up, but Anchor bounces are posted and the ${pendingVolume.toLocaleString("en-GB")} fees to apply match the estimate (~${Math.round(pendingEstVolume).toLocaleString("en-GB")}). Press the button when you're happy for me to run it — only ${authorisedUsersList(LATE_FEE_APPLY_AUTHORISED_USERS)} can action.`;
+        const pct = Math.round(closeRatio * 100);
+        const softText = `🟡 *Apply Late Fees — ready to run (manual confirm).* Fees to apply (${pendingVolume.toLocaleString("en-GB")}) are ${pct}% of the estimate (~${Math.round(pendingEstVolume).toLocaleString("en-GB")}), over the 90% threshold. Not auto-firing because:\n${failingReasonsSoFar.map(r => `  ${r}`).join("\n")}\nPress the button when you're happy for me to run it — only ${authorisedUsersList(LATE_FEE_APPLY_AUTHORISED_USERS)} can action.`;
         await app.client.chat.postMessage({
           token: SLACK_BOT_TOKEN,
           channel: CHANNELS.DATA_BILLING_UPDATES,
@@ -12541,7 +12618,7 @@ async function runLateFeeReadinessCheck() {
             { type: "actions", elements: [
               { type: "button", text: { type: "plain_text", text: "🚀 Run Apply Late Fees now", emoji: true }, style: "primary", action_id: "btn_run_late_fees",
                 value: JSON.stringify({ date: todayStr }),
-                confirm: { title: { type: "plain_text", text: "Run Apply Late Fees?" }, text: { type: "mrkdwn", text: `Fires the Apply Late Fees campaign (Make scenario ${LATE_FEE_APPLY_SCENARIO_ID}) now. GoCardless reconciliation is still catching up — you're confirming the Anchor bounce + fee signals look right.` }, confirm: { type: "plain_text", text: "Run it" }, deny: { type: "plain_text", text: "Cancel" } } },
+                confirm: { title: { type: "plain_text", text: "Run Apply Late Fees?" }, text: { type: "mrkdwn", text: `Fires the Apply Late Fees campaign (Make scenario ${LATE_FEE_APPLY_SCENARIO_ID}) now, even though readiness criteria aren't all green — you're confirming the ${pct}% fee volume signal is trustworthy.` }, confirm: { type: "plain_text", text: "Run it" }, deny: { type: "plain_text", text: "Cancel" } } },
             ]},
           ],
         });
