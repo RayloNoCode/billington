@@ -1258,6 +1258,15 @@ const CLOSE_REASON_COLUMNS = {
   asset_return_cancelled_device_received:  { col: "E", label: "Asset Return — Device Received", anchorTypeIds: [30] },
   escalation_asset_received:               { col: "F", label: "Escalation — Asset Received", anchorTypeIds: [] },
   fraud_and_vc_write_off:                  { col: "G", label: "Fraud & VC Write Off", anchorTypeIds: [26, 70] },
+  // Customer already paid the termination balance (incl. non-return fee) to settle
+  // and close the account, but it's still showing open with a small remaining
+  // balance — writing off that remainder to close it (Hargo, 04/08/2026, A00279541:
+  // NRF £451 applied + £632.38 settlement payment, but Anchor Balance still showed
+  // £342.40 outstanding). Deliberately the SAME column/TypeIds as fraud_and_vc_write_off
+  // (col G, TypeId 26/70 write-off) — it's the identical Anchor mechanism (write off
+  // the remaining balance), just NOT a fraud/VC case, so user-facing text must never
+  // call it that (Hargo: "don't state that in the msg").
+  termination_balance_paid:                { col: "G", label: "Termination Balance Paid (write off remaining balance)", anchorTypeIds: [26, 70] },
 };
 
 /**
@@ -1308,6 +1317,9 @@ async function isAgreementInCloseSheet(agreementId) {
 function parseCloseReason(text) {
   const lower = text.toLowerCase();
   // Test more specific patterns first to avoid overlap
+  // Termination balance already paid (incl. NRF) — checked BEFORE the plain "write
+  // off" catch-all so it resolves directly instead of asking (Hargo, 04/08/2026).
+  if (/\btermination\s+balance\b[\s\S]{0,40}\b(paid|settled)\b|\b(paid|settled)\b[\s\S]{0,40}\btermination\s+balance\b/.test(lower)) return "termination_balance_paid";
   if (/\b(asset\s+lost\s+in\s+transit|lost\s+in\s+transit)\b/.test(lower)) return "asset_lost_in_transit";
   if (/\b(fraud|vc[\s-]?write[\s-]?off)\b/.test(lower)) return "fraud_and_vc_write_off";
   // Plain "write off" without "fraud"/"vc"/"lost in transit" is ambiguous
@@ -5713,7 +5725,7 @@ Billington has access to:
 - refunds: Use when the user wants a status check, drill-down, or action on items in the #customer-refunds-and-complaints channel — e.g. "which refunds are pending?", "any unconfirmed refunds?", "check the refunds channel", "show me outstanding refund requests", "post a refunds update", "mark those as paid", "all refund files have been paid", "confirm this batch was paid yesterday", "update the threads as paid". Also use when someone confirms that refund files have been paid/processed by Barclays. Do NOT use for factual data questions about refunds like "what is the highest refund amount", "how many refunds have we processed" — those are "general".
 - tasks: Use when the user is asking about Billington's own scheduled tasks, routine, schedule, or automated checks — e.g. "what are your scheduled tasks?", "what do you do?", "your routine", "when do you check the refund channel?", "when is your next update?", "what are you monitoring?", "list your tasks", "your schedule". Do NOT use for user reminders (remind me / cancel reminder) — those are "reminder".
 - notices: Use when asking for the daily Notices QA report (LPF/NODS and NOSIA/SNOSIA email QA) — e.g. "NODS report", "NOSIA update", "notices QA", "show me today's notices", "how many NODS were sent?", "SNOSIA failures?", "LPF and NODS QA". If the question is an analytical query about NODS/NOSIA data (trends, comparisons, specific dates), use "bacs" instead to query BigQuery directly.
-- close_agreement: Use when the user wants to log an agreement closure, write-off, or close reason to the agreements sheet — e.g. "process write off for A00233543", "A00276240 asset lost in transit", "close A00259211 return to sender", "write off A00233543 and A00259211". Must include at least one agreement ID (A00XXXXXX) and a close reason (write off, lost in transit, return to sender, warranty return, asset return, escalation).
+- close_agreement: Use when the user wants to log an agreement closure, write-off, or close reason to the agreements sheet — e.g. "process write off for A00233543", "A00276240 asset lost in transit", "close A00259211 return to sender", "write off A00233543 and A00259211". Must include at least one agreement ID (A00XXXXXX) and a close reason (write off, lost in transit, return to sender, warranty return, asset return, escalation, termination balance paid — customer already paid to settle, write off any remaining balance).
 - instruction: the user is telling Billington to remember, learn, or update its behaviour.
 - reminder: the user is asking Billington to set a reminder, cancel a reminder, or list their OWN reminders — e.g. "remind me to check BACS at 3pm", "remind Charlotte to pick up the residuals issue on Monday", "cancel reminder #3", "what reminders do I have", "set a reminder for 10am tomorrow". Do NOT use for questions about Billington's own scheduled tasks — those are "tasks".
 - general: anything else — general questions, conversation, advice, OR statements/comments where Billington has been copied in but is not being directly asked to do anything (e.g. "think there was a data issue last night", "just so you know X happened").
@@ -25314,9 +25326,9 @@ Rules:
             }
           }
         } else if (!reason) {
-          reply = `I found ${agIds.length} agreement(s) but couldn't determine the close reason. Please specify one of: write off, asset lost in transit, return to sender, warranty return, asset return, escalation asset received.`;
+          reply = `I found ${agIds.length} agreement(s) but couldn't determine the close reason. Please specify one of: write off, asset lost in transit, return to sender, warranty return, asset return, escalation asset received, termination balance paid.`;
         } else if (reason === "ambiguous_write_off") {
-          reply = `Is this an *Asset Lost in Transit* or a *Fraud & VC Write Off* for ${agIds.join(", ")}?`;
+          reply = `Is this an *Asset Lost in Transit*, a *Fraud & VC Write Off*, or *Termination Balance Paid* (customer already paid to settle, just closing out a remaining balance) for ${agIds.join(", ")}?`;
         } else if (agIds.length === 0) {
           reply = "I couldn't find any agreement IDs in your message or thread. Please include at least one (e.g. A00233543).";
         } else {
@@ -28124,9 +28136,9 @@ ${wantsApiCheckDm ? "\nIMPORTANT: The user also asked to check Anchor's API — 
       const agIds = [...trimmed.matchAll(/\bA\d{5,9}\b/gi)].map(m => m[0].toUpperCase());
       const reason = parseCloseReason(trimmed);
       if (!reason) {
-        await say({ text: `I found ${agIds.length} agreement(s) but couldn't determine the close reason. Please specify one of: write off, asset lost in transit, return to sender, warranty return, asset return, escalation asset received.`, mrkdwn: true });
+        await say({ text: `I found ${agIds.length} agreement(s) but couldn't determine the close reason. Please specify one of: write off, asset lost in transit, return to sender, warranty return, asset return, escalation asset received, termination balance paid.`, mrkdwn: true });
       } else if (reason === "ambiguous_write_off") {
-        await say({ text: `Is this an *Asset Lost in Transit* or a *Fraud & VC Write Off* for ${agIds.join(", ")}?`, mrkdwn: true });
+        await say({ text: `Is this an *Asset Lost in Transit*, a *Fraud & VC Write Off*, or *Termination Balance Paid* (customer already paid to settle, just closing out a remaining balance) for ${agIds.join(", ")}?`, mrkdwn: true });
       } else if (agIds.length === 0) {
         await say({ text: "I couldn't find any agreement IDs in your message. Please include at least one (e.g. A00233543).", mrkdwn: true });
       } else {
