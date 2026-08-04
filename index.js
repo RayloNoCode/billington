@@ -7972,6 +7972,20 @@ function inferGogwCategory(cleanText, contextMessages) {
   ];
   if (fullSignals.some(r => r.test(ctx))) return "Full trade in value";
 
+  // 5b. Trade-in DECLINED but the device was sent to stock/kept anyway (Hargo,
+  // 03/08/2026 — A00378239: "the trade-in was declined, however, it was sent to
+  // stock anyway" matched NONE of the signals above, so category stayed null and
+  // no Post button could ever be offered, regardless of the amount being clear).
+  // The customer effectively lost the device with no trade-in payout, so this is
+  // a Full trade-in value refund. Order-agnostic (any wording order) — checks all
+  // three concepts appear, not a fixed phrase. Executor still reconciles vs Denton
+  // as usual for any Full/Partial trade-in category (Hargo: "figures should still
+  // be checked vs denton") — this only unblocks the CATEGORY, not the amount check.
+  const hasTradeIn = /\btrade.?in\b/i.test(ctx);
+  const hasDeclined = /\bdeclin(?:ed|e|es|ing)\b/i.test(ctx);
+  const hasStocked = /\bsent\s+(?:to|into)\s+stock\b|\bstock(?:ed)?\s+anyway\b|\bwent\s+to\s+stock\b|\bkept\s+(?:it\s+)?anyway\b/i.test(ctx);
+  if (hasTradeIn && hasDeclined && hasStocked) return "Full trade in value";
+
   return null;
 }
 
@@ -9751,9 +9765,19 @@ async function postRefundChasers(data) {
       }
       // Attach action buttons to the chase by bucket (Hargo, 25/06/2026): refund
       // questions get buttons; clicks route through the same gated handlers as the
-      // typed replies. ONE button-set per thread — scan the thread and skip if any
-      // refund button is already present, so the daily chase keeps going as text
-      // without stacking buttons (and so a later stage's buttons aren't duplicated).
+      // typed replies. ONE button-set per thread — scan the thread and skip if the
+      // bucket's OWN primary button is already present, so the daily chase keeps
+      // going as text without stacking buttons.
+      // Hargo, 03/08/2026 (A00378239): checking the WHOLE REFUND_CHASE_BUTTON_IDS
+      // family here was too broad — once ANY button appeared (e.g. a Mark-refunded-
+      // manually button offered before a figure could be locked), every LATER chase
+      // silently skipped re-offering the Post GOGW + refund button too, even after
+      // the figure became resolvable. Now check for the bucket's own relevant
+      // button specifically, so a later-resolving Post button can still appear.
+      const relevantButtonIds = item._bucket === "awaiting_processing" ? ["btn_post_gogw_refund"]
+        : item._bucket === "batch_files" ? ["btn_confirm_batch_paid"]
+        : item._bucket === "awaiting_approval" ? ["btn_refund_approve", "btn_refund_decline"]
+        : REFUND_CHASE_BUTTON_IDS;
       let chaseBlocks;
       if (INTERACTIVE_BUTTONS_ENABLED && item.thread_ts &&
           ["batch_files", "awaiting_approval", "awaiting_processing"].includes(item._bucket)) {
@@ -9763,7 +9787,7 @@ async function postRefundChasers(data) {
             token: SLACK_BOT_TOKEN, channel: CHANNELS.CUSTOMER_REFUNDS, ts: item.thread_ts, limit: 100,
           });
           buttonAlreadyInThread = (tr.messages || []).some(m =>
-            (m.blocks || []).some(b => b.type === "actions" && (b.elements || []).some(e => REFUND_CHASE_BUTTON_IDS.includes(e.action_id)))
+            (m.blocks || []).some(b => b.type === "actions" && (b.elements || []).some(e => relevantButtonIds.includes(e.action_id)))
           );
         } catch (e) {
           console.error(`[bill-ling] refund button thread-scan failed for ${item.thread_ts}:`, e.message);
