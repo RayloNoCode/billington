@@ -1,0 +1,45 @@
+# Dependabot — fleet-wide dependency patching.
+#
+# Why this file exists: the Monday weekly rebuild patches the OS (apt-get upgrade)
+# and the base image (the FROM tag floats), but requirements.txt / package.json use
+# exact pins. So a CVE in an application dependency was NOT fixed by the rebuild —
+# instead Trivy failed the build and someone had to raise a PR by hand. That is
+# fail-closed, but it is not hands-off. Dependabot closes that gap.
+#
+# Deliberately NO `docker` ecosystem. Base image tags float on purpose
+# (e.g. python:3.13-slim), so patch releases already arrive via the weekly
+# rebuild — and Dependabot would try to push 3.13 -> 3.14, which is an
+# unproven interpreter jump, not a security fix.
+#
+# Grouping keeps this to ~2 PRs per ecosystem per week: one for security fixes,
+# one for routine minor/patch. Major bumps come as individual PRs so they get
+# read properly.
+#
+# Reviewed 2026-08-05 (IT-141).
+
+version: 2
+updates:
+  - package-ecosystem: "npm"
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: sunday
+      time: "20:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "chore(deps)"
+    labels:
+      - dependencies
+    groups:
+      npm-security:
+        applies-to: security-updates
+        patterns:
+          - "*"
+      npm-minor-patch:
+        applies-to: version-updates
+        patterns:
+          - "*"
+        update-types:
+          - minor
+          - patch
