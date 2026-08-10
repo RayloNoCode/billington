@@ -496,6 +496,22 @@ async function isMentionOnlyChannel(channelId) {
   return false;
 }
 
+/**
+ * Read-only-via-forward channels (Hargo, 10/08/2026): STRICTER than
+ * isMentionOnlyChannel above — Billington must NEVER passively scan, respond
+ * to an explicit @-mention, or post in these channels, full stop. Billington
+ * is nonetheless a MEMBER of them (so it can resolve permalinks/forwards
+ * pointing INTO them from elsewhere — see resolveForwardedThreadText), but
+ * that access is only ever used via a deliberate, one-off fetch triggered by
+ * someone forwarding a message OUT of here into a channel Billington is
+ * actually active in (e.g. #collab-vc-complaint-writeoff-approval) — never by
+ * the passive event listeners below.
+ *   CNGL05M6K = #team-ops-reputational-risk
+ */
+const READ_ONLY_VIA_FORWARD_CHANNEL_IDS = new Set([
+  "CNGL05M6K", // #team-ops-reputational-risk
+]);
+
 // Human-readable names used in the summary prompt
 const CHANNEL_NAMES = {
   C0736RQNV8Q: "#data-billing-alerts",
@@ -4459,6 +4475,63 @@ async function getThreadPermalink(channelId, thread_ts) {
   } catch (_) { return null; }
 }
 
+// ---------------------------------------------------------------------------
+// Forward-resolution (Hargo, 10/08/2026): lets Billington read content from a
+// channel it's otherwise never allowed to passively scan or post in (e.g.
+// #team-ops-reputational-risk) via a DELIBERATE, one-off fetch — ONLY when
+// someone forwards/links a message FROM that channel into a channel Billington
+// is actually active in (e.g. #collab-vc-complaint-writeoff-approval). This is
+// the sole read path into those channels; see READ_ONLY_VIA_FORWARD_CHANNEL_IDS
+// for the corresponding "never respond in here" side of the rule.
+//
+// Detects a Slack permalink either in a native "Forward message" attachment
+// (checked via several possible field names since the exact attachment shape
+// isn't guaranteed) or just pasted as plain text — both produce the same
+// https://TEAM.slack.com/archives/CHANNELID/pTIMESTAMP URL, so parsing that
+// URL pattern directly is more robust than depending on exact field names.
+function extractSlackPermalink(message) {
+  const blobs = [message.text || ""];
+  for (const att of (message.attachments || [])) {
+    if (att.from_url) blobs.push(att.from_url);
+    if (att.original_url) blobs.push(att.original_url);
+    if (att.text) blobs.push(att.text);
+    if (att.footer) blobs.push(att.footer);
+  }
+  const combined = blobs.join("\n");
+  const m = combined.match(/https:\/\/[a-zA-Z0-9-]+\.slack\.com\/archives\/([A-Z0-9]+)\/p(\d+)/);
+  if (!m) return null;
+  const channelId = m[1];
+  const rawTs = m[2]; // e.g. "1707000000123456" -> "1707000000.123456"
+  const msgTs = rawTs.length > 6 ? `${rawTs.slice(0, -6)}.${rawTs.slice(-6)}` : rawTs;
+  // A thread_ts query param (present when the permalinked message is a reply)
+  // points at the true parent — prefer it so the FULL thread is fetched, not
+  // just the one linked reply.
+  const threadTsMatch = combined.match(/thread_ts=(\d+\.\d+)/);
+  const threadTs = threadTsMatch ? threadTsMatch[1] : msgTs;
+  return { channelId, threadTs };
+}
+
+// Fetches the live origin thread a forward points at. Best-effort: if
+// Billington isn't a member of the origin channel, conversations.replies
+// throws (not_in_channel) — caught and logged, returns null rather than
+// crashing the scan. Returns { channelId, threadTs, messages, text } or null.
+async function resolveForwardedThreadText(message) {
+  const link = extractSlackPermalink(message);
+  if (!link) return null;
+  try {
+    const tr = await app.client.conversations.replies({
+      token: SLACK_BOT_TOKEN, channel: link.channelId, ts: link.threadTs, limit: 200,
+    });
+    const messages = tr.messages || [];
+    if (!messages.length) return null;
+    const text = messages.map(m => getMessageText(m)).join("\n");
+    return { channelId: link.channelId, threadTs: link.threadTs, messages, text };
+  } catch (err) {
+    console.error(`[bill-ling] resolveForwardedThreadText: couldn't fetch ${link.channelId}/${link.threadTs} (bot may not be a member):`, err.message);
+    return null;
+  }
+}
+
 /**
  * Hourly proactive scan. For each of the two write-off channels, pull top-level
  * messages from the last WRITEOFF_SCAN_LOOKBACK_DAYS days, classify each
@@ -4530,6 +4603,7 @@ async function runWriteoffApprovalScan(opts = {}) {
     addedToSheet: [], // agreementId
     blockedOpenQuestion: [], // agreementId
     blockedRefundDue: [], // agreementId
+    blockedDebtSold: [], // agreementId — still sold to a debt purchaser (is_debt_sold=true)
     contextOnlySkipped: 0,
     alreadyHandled: 0,
     classifyErrors: 0,
@@ -4577,6 +4651,27 @@ async function runWriteoffApprovalScan(opts = {}) {
         continue;
       }
       if (threadMessages.length === 0) continue;
+
+      // Follow any forwarded-message link found in this thread (Hargo,
+      // 10/08/2026) — resolves the FULL live origin thread (e.g. an approval
+      // discussion forwarded from #team-ops-reputational-risk) and appends it
+      // so classifyWriteoffThread sees the real approval, not just whoever
+      // forwarded it. Silently no-ops if no forward is present or Billington
+      // isn't a member of the origin channel.
+      const seenForwardKeys = new Set();
+      const forwardedMessages = [];
+      for (const m of threadMessages) {
+        const resolved = await resolveForwardedThreadText(m);
+        if (!resolved) continue;
+        const fk = `${resolved.channelId}:${resolved.threadTs}`;
+        if (seenForwardKeys.has(fk)) continue;
+        seenForwardKeys.add(fk);
+        forwardedMessages.push(...resolved.messages);
+      }
+      if (forwardedMessages.length) {
+        threadMessages = [...threadMessages, ...forwardedMessages];
+        console.log(`[bill-ling] writeoff-scan: resolved ${forwardedMessages.length} message(s) from ${seenForwardKeys.size} forwarded thread(s) into ${ch.name}/${thread_ts}.`);
+      }
 
       // Combined text for agreement-ID extraction
       const combinedText = threadMessages
@@ -4794,6 +4889,43 @@ async function runWriteoffApprovalScan(opts = {}) {
           writeoffScanState.set(key, { outcome: "already_in_sheet", at: new Date().toISOString() });
           stateDirty = true;
           enrolWriteoffFollowup(agId, { sourceChannelId: ch.id, sourceThread_ts: thread_ts, sourceChannelName: ch.name });
+          continue;
+        }
+
+        // RULE (Hargo, 10/08/2026): if the agreement is still sold to a debt
+        // purchaser (Perch etc.), writing it off now would be premature —
+        // Raylo doesn't own the debt yet (A00111046, A00144908: approved for
+        // write-off but the debt sale hadn't been unwound). Check
+        // core_agreements.is_debt_sold (replaces the old funder_id=8 proxy,
+        // see billington-project). Non-terminal — re-evaluated every scan so
+        // it self-clears the moment is_debt_sold flips to false (debt bought
+        // back), same 20h cooldown pattern as the open-refund-question hold.
+        let debtSold = false;
+        try {
+          const rows = await runBigQueryRaw(`SELECT is_debt_sold FROM \`raylo-production.dbt_production.core_agreements\` WHERE agreement_id = '${agId}'`);
+          debtSold = rows.length > 0 && formatBQValue(rows[0].is_debt_sold) === "true"; // formatBQValue always stringifies
+        } catch (e) {
+          console.error(`[bill-ling] writeoff-scan: debt-sale check failed for ${agId}:`, e.message);
+        }
+        if (debtSold) {
+          const priorFlag = writeoffScanState.get(key);
+          const hoursSinceLastFlag = (priorFlag && priorFlag.outcome === "flagged_debt_sold")
+            ? (Date.now() - new Date(priorFlag.at).getTime()) / 3_600_000 : Infinity;
+          if (hoursSinceLastFlag > 20) {
+            const flagText =
+              `💰 *Held* — approved write-off but *${agId}* is still sold to a debt purchaser (is_debt_sold = true).\n\n` +
+              `*Approver:* ${approverName}${amount ? ` (£${amount.toFixed(2)})` : ""}\n` +
+              `*Source:* ${threadRef} in #${ch.name}\n\n` +
+              `Buy the debt back first — this will write off automatically once is_debt_sold flips to false.`;
+            try {
+              await sendDM(HARGO_USER_ID, flagText);
+              writeoffScanState.set(key, { outcome: "flagged_debt_sold", at: new Date().toISOString() });
+              stateDirty = true;
+            } catch (err) {
+              console.error(`[bill-ling] writeoff-scan: debt-sold DM failed for ${agId}:`, err.message);
+            }
+          }
+          summary.blockedDebtSold.push(agId);
           continue;
         }
 
@@ -21749,6 +21881,15 @@ function getMessageText(m) {
 
 async function handleMentionEvent(event, say) {
   const { text, channel, ts, thread_ts, user } = event;
+
+  // Read-only-via-forward channel (Hargo, 10/08/2026): never respond here,
+  // covers @-mentions, passive name-mentions, and direct thread replies — all
+  // three trigger types funnel through this shared handler. See
+  // READ_ONLY_VIA_FORWARD_CHANNEL_IDS for why Billington is a member anyway.
+  if (READ_ONLY_VIA_FORWARD_CHANNEL_IDS.has(channel)) {
+    console.log(`[bill-ling] Ignoring mention in read-only-via-forward channel ${channel}.`);
+    return;
+  }
 
   // Redact message text from logs in the sensitive VC write-off channel; we
   // still log the fact of a mention but never the body or referenced IDs.
