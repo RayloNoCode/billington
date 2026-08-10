@@ -19963,7 +19963,7 @@ async function runRepairWarrantyChargesCampaign() {
         from \`raylo-production.dbt_production.reports_EOL_notice_payment_info\` payment_info
         left join \`raylo-production.landing_billington.agreement_settlement_dates\` as settlement_dates on settlement_dates.agreement_id = payment_info.agreement_id
         left join \`raylo-production.dbt_production.core_agreements\` as core_agreements on core_agreements.agreement_id = payment_info.agreement_id
-        where damage_fee_added_to_profile = 0 and damage_fee_due_date_to_be_added_to_payment_profile is not null and funder_id <> 8
+        where damage_fee_added_to_profile = 0 and damage_fee_due_date_to_be_added_to_payment_profile is not null and core_agreements.is_debt_sold = false
         and settlement_dates.agreement_id is null
       )
       SELECT COUNT(*) AS agreements, ROUND(SUM(damage_fee_due), 2) AS total_damage_fee_due,
@@ -20061,7 +20061,7 @@ const CUSTOM_PROFILE_CANDIDATE_SQL = `
           AND date(dbt_agreements.next_payment_date) <> DATE_ADD(CURRENT_DATE(), INTERVAL MOD(8 - EXTRACT(DAYOFWEEK FROM CURRENT_DATE()) + 4, 7) + 1 DAY)
           AND DATE(last_dd.transaction_date) <> current_date AND dbt_subscriptions.number_missed_payments <= 2
           AND dbt_agreements.collections_on_hold = false AND dbt_agreements.current_status <> 'FROZEN (Internal)'
-          and dbt_agreements.funder_id <> 8 and (asset_returns.state = 'cancelled' OR asset_returns.state is null)
+          and dbt_agreements.is_debt_sold = false and (asset_returns.state = 'cancelled' OR asset_returns.state is null)
           AND coalesce(date(dbt_agreements.latest_promise_review_date),date('2000-01-01')) < current_date() )
     select agreement_id,
       case when total_arrears > 85 then custom_profiling.recurring_total_amount_after_tax else total_arrears end as custom_profiling_amount,
