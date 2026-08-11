@@ -8184,6 +8184,18 @@ function computeRefundLock(agreementId, threadText) {
   return { amount: amt, category: category || null, tag: tag || null, cmd, pending };
 }
 
+// True if the thread explicitly asks for a GOGW without ALSO asking for a
+// refund — a goodwill-credit-only request, not the standard paired GOGW+refund
+// computeRefundLock always builds (Hargo, 11/08/2026 — A00366625: Laura asked
+// "can we please post a £35 GOGW", not a refund; computeRefundLock can't infer
+// a category from that alone, so lock.cmd stays null and callers fell through
+// to a generic "action the refund" fallback that mislabelled the ask AND only
+// offered a "Mark refunded manually" button — no way to post a GOGW at all).
+function isGogwOnlyRequest(text) {
+  const t = String(text || "");
+  return /\b(gogw|gesture\s+of\s+goodwill)\b/i.test(t) && !/\brefund(s|ed|ing)?\b/i.test(t);
+}
+
 /**
  * Work out FULL vs PARTIAL trade-in from Denton's figures by comparing the
  * refund amount to the values themselves (Hargo, 07/07/2026 — "confirm himself
@@ -10240,18 +10252,38 @@ async function checkRefundApprovals() {
       });
       if (alreadyConfirmed) { approvalNotifiedThreads.set(msg.ts, "confirmed"); continue; }
 
-      // Check Anchor for refund posting
-      let refundPosted = false;
+      // Check Anchor for GOGW posting (Hargo, 11/08/2026 — A00391877: a
+      // self-approved "CS escalation" is a GOGW-only goodwill credit, NOT a
+      // refund. Checking checkAnchorForRefund (TypeId 149) here was wrong on
+      // two counts — it both mislabelled the action as a "refund" in the
+      // message AND would never recognise a GOGW-only posting as complete,
+      // since a GOGW never creates a TypeId 149 transaction.
+      let gogwPosted = false;
       let anchorDetail = "";
+      let requestDate = null;
       if (agIds.length > 0) {
-        const requestDate = new Date(Number(msg.ts) * 1000).toISOString().slice(0, 10);
-        const result = await checkAnchorForRefund(agIds[0], requestDate);
-        refundPosted = result.posted;
-        anchorDetail = result.detail || "";
+        requestDate = new Date(Number(msg.ts) * 1000).toISOString().slice(0, 10);
+        try {
+          const gx = await getAgreementFromAnchor(agIds[0]);
+          const gblocks = gx.match(/<(?:a:)?Transaction>[\s\S]*?<\/(?:a:)?Transaction>/g) || [];
+          let posted61 = 0, reversed61 = 0, latestDate = null;
+          for (const blk of gblocks) {
+            const tm = blk.match(/<(?:a:)?TypeId>(\d+)<\/(?:a:)?TypeId>/); if (!tm) continue;
+            const tid = parseInt(tm[1], 10);
+            if (tid !== 61 && tid !== 62) continue;
+            const dm = blk.match(/<(?:a:)?TransactionDate>([^<]+)<\/(?:a:)?TransactionDate>/);
+            const d = dm ? dm[1].slice(0, 10) : null;
+            if (d && d < requestDate) continue;
+            const am = blk.match(/<(?:a:)?Amount>([^<]+)<\/(?:a:)?Amount>/);
+            const a = am ? Math.abs(parseFloat(am[1])) : 0;
+            if (tid === 61) { posted61 += a; if (!latestDate || d > latestDate) latestDate = d; } else reversed61 += a;
+          }
+          if (posted61 - reversed61 > 0.01) { gogwPosted = true; anchorDetail = `£${(posted61 - reversed61).toFixed(2)} GOGW posted on ${latestDate}`; }
+        } catch (_) { /* can't read — fall through, will re-check next cycle */ }
       }
 
-      if (refundPosted) {
-        const confirmText = `Refund for ${agIds[0]} has been posted in Anchor (${anchorDetail}). ✅ Marking as complete.`;
+      if (gogwPosted) {
+        const confirmText = `GOGW for ${agIds[0]} has been posted in Anchor (${anchorDetail}). ✅ Marking as complete.`;
         try {
           await app.client.chat.postMessage({ token: SLACK_BOT_TOKEN, channel: CHANNELS.CUSTOMER_REFUNDS, thread_ts: msg.ts, text: confirmText, mrkdwn: true });
           await app.client.reactions.add({ token: SLACK_BOT_TOKEN, channel: CHANNELS.CUSTOMER_REFUNDS, timestamp: msg.ts, name: "white_check_mark" }).catch(() => {});
@@ -10259,16 +10291,29 @@ async function checkRefundApprovals() {
         } catch (err) { console.error(`[bill-ling] CS escalation confirm error:`, err.message); }
       } else if (!alreadyNotified) {
         const processingTarget = await getAvailableChaseTarget(REFUND_CHASE_CHAINS.PROCESSING);
-        const notifyText = `CS escalation refund${agRef} — self-approved by ${requesterName || "CS"}. <@${processingTarget.id}>, this is good to go for processing.`;
+        const gogwAmount = agIds.length > 0 ? extractAmountFromContext(agIds[0], msg.text || "") : null;
+        const amountLine = gogwAmount ? ` *£${gogwAmount.toFixed(2)}*` : "";
+        const notifyText = `CS escalation GOGW${agRef}${amountLine} — self-approved by ${requesterName || "CS"}. This is a goodwill credit, not a cash refund. <@${processingTarget.id}>, this is good to go for processing.`;
+        const elements = [];
+        if (gogwAmount && agIds.length === 1) {
+          elements.push({
+            type: "button", text: { type: "plain_text", text: `💳 Post GOGW £${gogwAmount.toFixed(2)} (no refund)`, emoji: true }, style: "primary",
+            action_id: "btn_post_escalation_gogw_only",
+            value: JSON.stringify({ t: msg.ts, c: CHANNELS.CUSTOMER_REFUNDS, ag: agIds[0], amount: gogwAmount }),
+            confirm: { title: { type: "plain_text", text: "Post GOGW only?" }, text: { type: "mrkdwn", text: `Posts a £${gogwAmount.toFixed(2)} GOGW (TypeId 61, Escalation resolution) on ${agIds[0]}. No refund (TypeId 149) is posted — this is a goodwill credit, not a cash refund.` }, confirm: { type: "plain_text", text: "Post it" }, deny: { type: "plain_text", text: "Cancel" } },
+          });
+        }
+        elements.push(billingtonIncorrectButton());
         try {
-          await app.client.chat.postMessage({ token: SLACK_BOT_TOKEN, channel: CHANNELS.CUSTOMER_REFUNDS, thread_ts: msg.ts, text: notifyText, mrkdwn: true });
+          await app.client.chat.postMessage({ token: SLACK_BOT_TOKEN, channel: CHANNELS.CUSTOMER_REFUNDS, thread_ts: msg.ts, text: notifyText, mrkdwn: true,
+            blocks: [{ type: "section", text: { type: "mrkdwn", text: notifyText } }, { type: "actions", elements }] });
           notified++;
           console.log(`[bill-ling] CS escalation notification posted in thread ${msg.ts}${agRef}`);
         } catch (err) { console.error(`[bill-ling] CS escalation notify error:`, err.message); }
       } else {
         console.log(`[bill-ling] Approval monitor: thread ${msg.ts}${agRef} — CS escalation already notified, checking Anchor next cycle`);
       }
-      approvalNotifiedThreads.set(msg.ts, refundPosted ? "confirmed" : today);
+      approvalNotifiedThreads.set(msg.ts, gogwPosted ? "confirmed" : today);
       continue;
     }
 
@@ -20782,6 +20827,65 @@ function summariseGogwCredit(res, user, amount) {
   return lines.join("\n");
 }
 
+// "Post GOGW (no refund)" on a self-approved CS escalation (Hargo, 11/08/2026 —
+// A00391877). Deliberately GOGW-ONLY (TypeId 61), no paired refund — these are
+// goodwill credits for a service failure, not reimbursing an overpayment, and
+// unlike btn_batch_gogw_credit this is NOT conditioned on the agreement being
+// in arrears (a customer with £0 arrears can still be legitimately owed one).
+app.action("btn_post_escalation_gogw_only", async ({ body, ack, client }) => {
+  await ack();
+  const user = body.user?.id, ch = body.channel?.id, ts = body.message?.ts;
+  const threadTs = body.message?.thread_ts || ts;
+  try {
+    if (!BILLINGTON_REFUND_AUTHORISERS.has(user)) {
+      await client.chat.postEphemeral({ token: SLACK_BOT_TOKEN, channel: ch, user, text: `Only ${BILLINGTON_REFUND_AUTHORISER_NAMES} can post this GOGW.` });
+      return;
+    }
+    let payload; try { payload = JSON.parse(body.actions?.[0]?.value || "{}"); } catch (_) { payload = {}; }
+    const agId = (payload.ag || "").toUpperCase();
+    const amount = Number(payload.amount);
+    if (!/^A\d{5,9}$/.test(agId) || !(amount > 0)) { await client.chat.postEphemeral({ token: SLACK_BOT_TOKEN, channel: ch, user, text: `Couldn't read the GOGW details.` }); return; }
+    try {
+      const kept = (body.message?.blocks || []).filter(b => b.type !== "actions");
+      kept.push({ type: "context", elements: [{ type: "mrkdwn", text: `💳 Posting GOGW £${amount.toFixed(2)} (no refund) on ${agId} (started by <@${user}>)…` }] });
+      await client.chat.update({ token: SLACK_BOT_TOKEN, channel: ch, ts, text: body.message?.text || "Posting GOGW.", blocks: kept });
+    } catch (_) {}
+    const today = new Date().toLocaleDateString("en-CA", { timeZone: "Europe/London" });
+    let alreadyPosted = false;
+    try {
+      const gx = await getAgreementFromAnchor(agId);
+      const gblocks = gx.match(/<(?:a:)?Transaction>[\s\S]*?<\/(?:a:)?Transaction>/g) || [];
+      let posted61 = 0, reversed61 = 0;
+      for (const blk of gblocks) {
+        const tm = blk.match(/<(?:a:)?TypeId>(\d+)<\/(?:a:)?TypeId>/); if (!tm) continue;
+        const tid = parseInt(tm[1], 10); if (tid !== 61 && tid !== 62) continue;
+        const dm = blk.match(/<(?:a:)?TransactionDate>([^<]+)<\/(?:a:)?TransactionDate>/);
+        const d = dm ? dm[1].slice(0, 10) : null; if (d && d < today) continue;
+        const am = blk.match(/<(?:a:)?Amount>([^<]+)<\/(?:a:)?Amount>/); const a = am ? Math.abs(parseFloat(am[1])) : 0;
+        if (tid === 61) posted61 += a; else reversed61 += a;
+      }
+      if (posted61 - reversed61 > 0.01) alreadyPosted = true;
+    } catch (_) { /* can't read — let the post run */ }
+    if (alreadyPosted) {
+      await client.chat.postMessage({ token: SLACK_BOT_TOKEN, channel: ch, thread_ts: threadTs, text: `⏭️ *${agId}* already has a GOGW posted today — not posting again.`, mrkdwn: true });
+      return;
+    }
+    try {
+      await addTransactionToAnchor(agId, today, amount, `Escalation resolution — Billington auto-action (Slack thread approval, GOGW only).`.slice(0, 150), 61, {
+        requestedByUserId: user, triggeredBy: user, triggerSource: "slack_button", actionType: "gogw_posted",
+        description: `GOGW £${amount.toFixed(2)} (Escalation resolution, no refund) posted via Slack button on ${agId}`,
+        idempotencyKey: `gogw_escalation_only:${agId}:${today}`,
+      });
+      await client.chat.postMessage({ token: SLACK_BOT_TOKEN, channel: ch, thread_ts: threadTs, text: `✅ *${agId}* — GOGW £${amount.toFixed(2)} posted (TypeId 61, Escalation resolution). No refund posted — this was a goodwill credit, not a cash refund.`, mrkdwn: true });
+    } catch (err) {
+      await client.chat.postMessage({ token: SLACK_BOT_TOKEN, channel: ch, thread_ts: threadTs, text: `❌ GOGW post failed for *${agId}*: ${err.message}`, mrkdwn: true });
+    }
+  } catch (err) {
+    console.error("[bill-ling] btn_post_escalation_gogw_only error:", err.message);
+    try { await client.chat.postMessage({ token: SLACK_BOT_TOKEN, channel: ch, thread_ts: threadTs, text: `⚠️ GOGW post hit an error: ${err.message}`, mrkdwn: true }); } catch (_) {}
+  }
+});
+
 app.action("btn_batch_gogw_credit", async ({ body, ack, client }) => {
   await ack();
   const user = body.user?.id, ch = body.channel?.id, ts = body.message?.ts;
@@ -26748,19 +26852,27 @@ app.action("btn_refund_approve", async ({ body, ack, client }) => {
     const today = new Date().toLocaleDateString("en-CA", { timeZone: "Europe/London" });
     try { approvalNotifiedThreads.set(threadTs, today); } catch (_) {} // stop the approval chase today
     // Lock the figure from the thread so we can offer the Post button.
-    let lock = null, agId = null, overduePhrase = "";
+    let lock = null, agId = null, overduePhrase = "", inferenceText = "";
     try {
       const tr = await client.conversations.replies({ token: SLACK_BOT_TOKEN, channel, ts: threadTs, limit: 50 });
-      const inferenceText = (tr.messages || []).map(m => getMessageText(m)).join("\n");
+      inferenceText = (tr.messages || []).map(m => getMessageText(m)).join("\n");
       agId = (ref && /^A\d{5,9}$/i.test(ref)) ? ref.toUpperCase() : ((inferenceText.match(/\bA\d{5}(?:\d{3})?\b/i) || [])[0] || "").toUpperCase();
       if (agId) lock = computeRefundLock(agId, inferenceText);
       overduePhrase = overdueAssessmentPhrase(inferenceText);
     } catch (e) { console.error("[bill-ling] btn_refund_approve lock:", e.message); }
+    // GOGW-only detection (Hargo, 11/08/2026): only relevant when computeRefundLock
+    // couldn't build a paired command — if it DID, that's the right action already.
+    const gogwOnlyAsk = !(lock && lock.cmd) && isGogwOnlyRequest(inferenceText);
+    const gogwOnlyAmount = gogwOnlyAsk && agId ? extractAmountFromContext(agId, inferenceText) : null;
     const elements = [];
     if (lock && lock.pending && lock.amount > 0 && agId) elements.push(processAnywayButton(threadTs, channel, agId, lock.amount, lock.category));
     if (lock && lock.cmd) {
       elements.push({ type: "button", text: { type: "plain_text", text: "💸 Post GOGW + refund", emoji: true }, style: "primary", action_id: "btn_post_gogw_refund", value: JSON.stringify({ t: threadTs, c: channel }),
         confirm: { title: { type: "plain_text", text: "Post GOGW + refund?" }, text: { type: "mrkdwn", text: `I'll run my usual checks then post:\n\`${lock.cmd}\`` }, confirm: { type: "plain_text", text: "Post it" }, deny: { type: "plain_text", text: "Cancel" } } });
+    } else if (gogwOnlyAmount && agId) {
+      elements.push({ type: "button", text: { type: "plain_text", text: `💳 Post GOGW £${gogwOnlyAmount.toFixed(2)} (no refund)`, emoji: true }, style: "primary",
+        action_id: "btn_post_escalation_gogw_only", value: JSON.stringify({ t: threadTs, c: channel, ag: agId, amount: gogwOnlyAmount }),
+        confirm: { title: { type: "plain_text", text: "Post GOGW only?" }, text: { type: "mrkdwn", text: `Posts a £${gogwOnlyAmount.toFixed(2)} GOGW (TypeId 61, Escalation resolution) on ${agId}. No refund (TypeId 149) is posted — this is a goodwill credit, not a cash refund.` }, confirm: { type: "plain_text", text: "Post it" }, deny: { type: "plain_text", text: "Cancel" } } });
     }
     elements.push({ type: "button", text: { type: "plain_text", text: "✋ Mark refunded manually", emoji: true }, action_id: "btn_refund_manual", value: JSON.stringify({ t: threadTs, c: channel, ref }),
       confirm: { title: { type: "plain_text", text: "Mark refunded manually?" }, text: { type: "mrkdwn", text: "Records that this refund was actioned by hand and stops the chase. Charlotte/Ciaran/Hargo only." }, confirm: { type: "plain_text", text: "Mark done" }, deny: { type: "plain_text", text: "Cancel" } } });
@@ -26771,6 +26883,10 @@ app.action("btn_refund_approve", async ({ body, ack, client }) => {
           : `⚠️ Approved by <@${user}>, but ${ref ? `*${ref}*` : "this"} trade-in has *not been assessed* yet.${overduePhrase} I couldn't read a clear figure to offer a one-click button, so ${BILLINGTON_REFUND_AUTHORISER_NAMES} can post it explicitly with the amount.`)
       : (lock && lock.cmd)
       ? `✅ Approved by <@${user}>. Good to go for processing:\n• GOGW: *£${lock.amount.toFixed(2)}* (TypeId 61)\n• Refund: *£${lock.amount.toFixed(2)}* (TypeId 149)\n• Type: *${lock.category}*\nCommand: \`${lock.cmd}\`\n${BILLINGTON_REFUND_AUTHORISER_NAMES} can post it, or Charlotte/Ciaran can mark it refunded manually.`
+      : gogwOnlyAmount
+      ? `✅ Approved by <@${user}>. This is a GOGW-only request (no refund) for *£${gogwOnlyAmount.toFixed(2)}* — use the button below to post it, or Charlotte/Ciaran can action it manually.`
+      : gogwOnlyAsk
+      ? `✅ Approved by <@${user}>. This looks like a GOGW-only request (no refund), but I couldn't read a clear amount — ${BILLINGTON_REFUND_AUTHORISER_NAMES} can post it explicitly, e.g. \`post GOGW on ${agId || "A00XXXXXX"} £AMOUNT\`.`
       : `✅ Approved by <@${user}>. Good to go for processing — Charlotte/Ciaran to action the refund, then mark it done.`;
     await client.chat.postMessage({ token: SLACK_BOT_TOKEN, channel, thread_ts: threadTs, text: headline, blocks: [{ type: "section", text: { type: "mrkdwn", text: headline } }, { type: "actions", elements }], mrkdwn: true });
   } catch (err) {
