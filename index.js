@@ -591,6 +591,7 @@ You have the following cron jobs that run automatically:
 - 12:00 Mon-Fri: Bank holiday profile check (agreements with instalments due on UK bank holidays; ≤10 → verify each via Anchor, else post the query)
 - 13:00 Mon-Fri: Hire-agreement audit — picks 2 agreements/day (one template-rotation pick for coverage + one most-recently-created), validates each against Anchor (name / email / address / monthly / term / start-date), and posts a card with Pass / Fail / "Billington is incorrect" buttons to #collab-hire-agreement-audit-updates
 - 15:00 Mon-Fri: BACS batch file summary to #data-billing-updates
+- 18:00 Mon-Fri: Hire-agreement audit same-day recheck — re-runs any card still deferred from a null field a few hours after the 13:00 post (in addition to the 09:30 next-day chaser), without picking a new sample
 - 15:00 Mon-Fri: Notices QA report (LPF/NODS + NOSIA/SNOSIA email QA) to #data-billing-updates
 - 15:30 Mon-Fri: Missing instalment due control check (flags agreements missing instalment-due transactions, verifies via Anchor; ask "which agreements are missing?" to drill down, or "check all" to re-verify the whole flagged population)
 - 16:00 Mon-Fri: Apply Final Hire Payment campaign
@@ -13641,9 +13642,18 @@ function validateAgreementVsAnchor(candidate, anchorFields) {
     if (Number.isNaN(da) || Number.isNaN(db)) return Infinity;
     return Math.abs(da - db) / 86400_000;
   };
-  const haSignedDate = (candidate.hirerSignedAt || "").slice(0, 10);
-  const companySignedDate = (candidate.companySignedAt || "").slice(0, 10);
-  const dispatchDate = (candidate.dispatchedOn || "").slice(0, 10);
+  // formatBQValue() stringifies a genuine SQL NULL as the literal string
+  // "null" (not JS null/""), which is truthy — so `candidate.dispatchedOn ||
+  // ""` never catches it and a null dispatch date (order_latest_fulfillment_id
+  // unlinked) was falling through to a real date comparison against the
+  // string "null", producing a false ❌ mismatch instead of deferring
+  // (A00404302, Charlotte Platt, 10/08/2026 — order_latest_fulfillment_id was
+  // null so the dispatch date lookup returned "null", Anchor's AgreementDate
+  // of 29/07 was correct all along).
+  const bqDate = (v) => (!v || v === "null") ? "" : v;
+  const haSignedDate = bqDate(candidate.hirerSignedAt).slice(0, 10);
+  const companySignedDate = bqDate(candidate.companySignedAt).slice(0, 10);
+  const dispatchDate = bqDate(candidate.dispatchedOn).slice(0, 10);
   const startEventType = candidate.startEventType || "";
   const initiationCategory = candidate.initiationCategory || "";
   {
@@ -13935,6 +13945,48 @@ async function postDailyHireAgreementAudits() {
 }
 
 /**
+ * Re-run validation for ONE deferred audit (a null field at post time) and
+ * update the card in place. Shared by the 18:00 same-day pass and the 09:30
+ * next-day chase — never re-picks a different agreement, always re-checks
+ * the SAME `a.candidate` snapshot recorded when the card first posted.
+ */
+async function recheckOneDeferredHireAudit(a) {
+  try {
+    const freshLines = await computeHireAuditValidationLines(a.candidate);
+    const stillDeferred = freshLines.some(l => typeof l === "string" && l.includes("re-checking next working day"));
+    const newText = renderHireAuditCardText(a.candidate, freshLines);
+    await app.client.chat.update({ token: SLACK_BOT_TOKEN, channel: a.channel, ts: a.messageTs, text: newText.slice(0, 3000), blocks: buildHireAuditBlocks(newText) });
+    if (!stillDeferred) {
+      a.needsRecheck = false;
+      saveHireAgreementAudits();
+      await app.client.chat.postMessage({ token: SLACK_BOT_TOKEN, channel: a.channel, thread_ts: a.messageTs, text: `🔄 Re-checked *${a.agreementId}* — the field that was null has now landed, card updated above.`, mrkdwn: true, unfurl_links: false, unfurl_media: false }).catch(() => {});
+    } else {
+      console.log(`[bill-ling] Audit recheck: ${a.agreementId} still has a null field — will re-check again later.`);
+    }
+  } catch (e) {
+    console.error(`[bill-ling] Audit recheck failed for ${a.agreementId}:`, e.message);
+  }
+}
+
+/**
+ * Same-day recheck — runs Mon-Fri 18:00 London, ~5 hours after the 13:00
+ * post (Charlotte Platt, 10/08/2026 — A00404302: wanted a same-day recheck
+ * of a deferred null field rather than waiting for the next working day).
+ * Only re-runs validation on cards still deferred from a null field; does
+ * NOT chase/ping Charlotte — that stays exclusively the 09:30 job's role.
+ */
+async function recheckDeferredHireAuditsSameDay() {
+  // auditDate is stored in UTC (see postDailyHireAgreementAudits) — compare
+  // against UTC "today" to match, rather than London-local.
+  const todayUtcIso = new Date().toISOString().slice(0, 10);
+  for (const a of hireAgreementAudits) {
+    if (a.status !== "pending" || !a.needsRecheck || !a.candidate) continue;
+    if (a.auditDate !== todayUtcIso) continue;
+    await recheckOneDeferredHireAudit(a);
+  }
+}
+
+/**
  * Chase — runs Mon-Fri 09:30 London. For each pending audit posted on or
  * before the previous working day with no ✅, no ❌ and no chase yet, post a
  * thread reply pinging Charlotte. We only chase ONCE per audit; subsequent
@@ -13956,27 +14008,13 @@ async function chasePendingHireAgreementAudits() {
   for (const a of hireAgreementAudits) {
     if (a.status !== "pending") continue;
 
-    // Daily recheck of a null/deferred field (Hargo, 24/07/2026): if a validation input
-    // was null when the card posted (flagged "re-checking next working day"), re-run the
-    // checks for the SAME agreement now and update the card in place. Once the data lands
-    // the ⏳ flips to ✅/❌; if still null it stays deferred and re-checks again tomorrow.
-    if (a.needsRecheck && a.candidate) {
-      try {
-        const freshLines = await computeHireAuditValidationLines(a.candidate);
-        const stillDeferred = freshLines.some(l => typeof l === "string" && l.includes("re-checking next working day"));
-        const newText = renderHireAuditCardText(a.candidate, freshLines);
-        await app.client.chat.update({ token: SLACK_BOT_TOKEN, channel: a.channel, ts: a.messageTs, text: newText.slice(0, 3000), blocks: buildHireAuditBlocks(newText) });
-        if (!stillDeferred) {
-          a.needsRecheck = false;
-          saveHireAgreementAudits();
-          await app.client.chat.postMessage({ token: SLACK_BOT_TOKEN, channel: a.channel, thread_ts: a.messageTs, text: `🔄 Re-checked *${a.agreementId}* — the field that was null has now landed, card updated above.`, mrkdwn: true, unfurl_links: false, unfurl_media: false }).catch(() => {});
-        } else {
-          console.log(`[bill-ling] Audit recheck: ${a.agreementId} still has a null field — will re-check again next working day.`);
-        }
-      } catch (e) {
-        console.error(`[bill-ling] Audit recheck failed for ${a.agreementId}:`, e.message);
-      }
-    }
+    // Recheck of a null/deferred field: if a validation input was null when
+    // the card posted (flagged "re-checking next working day"), re-run the
+    // checks for the SAME agreement now and update the card in place. Once the
+    // data lands the ⏳ flips to ✅/❌; if still null it stays deferred and
+    // re-checks again next pass (Hargo, 24/07/2026; extracted to a shared
+    // helper 10/08/2026 so it can also run from the same-day 18:00 pass).
+    if (a.needsRecheck && a.candidate) await recheckOneDeferredHireAudit(a);
 
     // Resilience (Hargo, 18/06/2026): a ✅/❌ reaction added while the bot was
     // restarting (e.g. during a deploy) is dropped by Socket Mode, so the
@@ -21083,6 +21121,16 @@ cron.schedule(
   { timezone: "Europe/London" }
 );
 console.log("[bill-ling] Hire agreement audit chase cron scheduled for 09:30 Mon-Fri (Europe/London).");
+
+// Cron: Mon-Fri 18:00 London — same-day recheck of deferred (null-field) audits,
+// ~5 hours after the 13:00 post (Charlotte Platt, 10/08/2026). Recheck-only,
+// no chase/ping — that stays the 09:30 job's job.
+cron.schedule(
+  "0 18 * * 1-5",
+  () => { recheckDeferredHireAuditsSameDay().catch(err => console.error("[bill-ling] recheckDeferredHireAuditsSameDay cron error:", err.message)); },
+  { timezone: "Europe/London" }
+);
+console.log("[bill-ling] Hire agreement audit same-day recheck cron scheduled for 18:00 Mon-Fri (Europe/London).");
 
 // ---------------------------------------------------------------------------
 // Cron: hourly — Waive Log → close sheet sync + report to data-billing-updates
